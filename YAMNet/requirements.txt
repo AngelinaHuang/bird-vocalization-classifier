@@ -1,0 +1,8 @@
+tensorflow>=2.10
+tensorflow-hub
+librosa
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn

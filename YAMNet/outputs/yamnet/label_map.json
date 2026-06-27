@@ -1,0 +1,14 @@
+{
+  "label2idx": {
+    "BlueJay": 0,
+    "american_robin": 1,
+    "house_sparrow": 2,
+    "northern_cardinal": 3
+  },
+  "idx2label": {
+    "0": "BlueJay",
+    "1": "american_robin",
+    "2": "house_sparrow",
+    "3": "northern_cardinal"
+  }
+}
