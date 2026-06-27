@@ -1,0 +1,104 @@
+import pandas as pd
+import numpy as np
+from sklearn.utils import resample
+
+def stratified_sampling(df, n_samples=2000, min_per_species=5):
+    """
+    Dual-layer stratified sampling by species and SNR tier.
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        Full dataset with columns: primary_label, snr_tier
+    n_samples : int
+        Target total sample size (~2000)
+    min_per_species : int
+        Minimum samples to retain per species (5)
+    
+    Returns:
+    --------
+    DataFrame : Balanced representative subset
+    """
+    
+    # Define SNR tiers
+    def assign_snr_tier(snr):
+        if snr >= 15:
+            return 'High'
+        elif snr >= 0:
+            return 'Medium'
+        else:
+            return 'Heavy'
+    
+    df['snr_tier'] = df['snr'].apply(assign_snr_tier)
+    
+    # Get species counts
+    species_counts = df['primary_label'].value_counts()
+    n_species = len(species_counts)
+    
+    # Calculate base allocation per species
+    base_per_species = max(min_per_species, int(n_samples / n_species))
+    
+    # Adjust for rare species (fewer than base_per_species available)
+    sampled_dfs = []
+    
+    for species in species_counts.index:
+        species_df = df[df['primary_label'] == species]
+        available = len(species_df)
+        
+        # Target samples for this species
+        target = min(base_per_species, available)
+        
+        # Stratify within species by SNR tier
+        tier_counts = species_df['snr_tier'].value_counts()
+        proportions = tier_counts / tier_counts.sum()
+        
+        # Allocate samples proportionally across SNR tiers
+        samples_per_tier = {}
+        remaining = target
+        
+        for tier in ['High', 'Medium', 'Heavy']:
+            if tier in proportions:
+                allocated = int(round(proportions[tier] * target))
+                samples_per_tier[tier] = min(allocated, 
+                                            len(species_df[species_df['snr_tier'] == tier]))
+                remaining -= samples_per_tier[tier]
+        
+        # Distribute remaining samples
+        for tier in ['High', 'Medium', 'Heavy']:
+            if remaining > 0 and tier in proportions:
+                available_in_tier = len(species_df[species_df['snr_tier'] == tier])
+                additional = min(remaining, 
+                                available_in_tier - samples_per_tier.get(tier, 0))
+                samples_per_tier[tier] = samples_per_tier.get(tier, 0) + additional
+                remaining -= additional
+        
+        # Sample from each tier
+        for tier, n in samples_per_tier.items():
+            if n > 0:
+                tier_df = species_df[species_df['snr_tier'] == tier]
+                sampled = tier_df.sample(n=n, random_state=42)
+                sampled_dfs.append(sampled)
+    
+    subset = pd.concat(sampled_dfs)
+    
+    # If subset is smaller than target, add random samples from over-represented species
+    if len(subset) < n_samples:
+        additional_needed = n_samples - len(subset)
+        # Identify species with surplus (more than min_per_species)
+        surplus_species = []
+        for species in species_counts.index:
+            current = len(subset[subset['primary_label'] == species])
+            if current > min_per_species:
+                surplus = current - min_per_species
+                surplus_species.extend([species] * surplus)
+        
+        if surplus_species:
+            additional_samples = df[df['primary_label'].isin(
+                np.random.choice(surplus_species, 
+                                min(additional_needed, len(surplus_species)), 
+                                replace=False)
+            )].sample(n=min(additional_needed, len(surplus_species)), 
+                     random_state=42)
+            subset = pd.concat([subset, additional_samples])
+    
+    return subset.reset_index(drop=True)
