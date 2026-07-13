@@ -24,11 +24,9 @@ This project investigates which modeling paradigm degrades most gracefully as no
 
 ## 2. Dataset
 
-- **Source**: bird vocalization audio organized as `data/raw/<species>/<clip>.{wav,mp3,flac}`. Each subfolder name defines one class label.
+- **Source**: bird vocalization metadata from the Google Perch / BirdCLEF 2021–2026 competitions. The team field-level-deduplicated and dual-layer-stratified-sampled the six annual CSVs into `ml_cv_fold1_train.csv` / `ml_cv_fold1_val.csv` / `ml_test.csv`; audio files are mounted under Kaggle's BirdCLEF yearly dataset directories. **1,229 species** in total.
 - **Preprocessing**: all clips are resampled to **16 kHz mono**, peak-normalized to **[−1, 1]** in `float32`, and fixed to a uniform length (center-trim or zero-pad).
-- **Splits**: stratified train / validation / test split (70 / 15 / 15 %) with class proportions preserved. The split is deterministic (fixed seed) so that the noise-robustness evaluation reuses the exact same test set.
-
-> The pipeline reads any folder-structured audio collection, so it accepts both the full project dataset and small development subsets interchangeably.
+- **Splits**: 80/20 stratified train/test split preserving SNR-tier proportions; a 5-fold stratified cross-validation is nested within the training set (YAMNet uses fold1: 3,824 train / 956 val), with a 1,196-sample held-out test set. The split is deterministic (fixed seed) so that the noise-robustness evaluation reuses the exact same test set. See `Data Processing Documentation.md` for details.
 
 ---
 
@@ -76,7 +74,6 @@ YAMNet/
 ├── .gitignore
 ├── _inspect.py                        # quick inspection of cached outputs
 ├── data/
-│   ├── raw/                           # <species>/<clip>.{wav,mp3,flac}  (gitignored)
 │   └── processed/                     # (reserved for future preprocessing)
 ├── src/
 │   ├── yamnet_bird_pipeline.py        # YAMNet embedding extraction + head training
@@ -124,7 +121,7 @@ cd src
 python yamnet_bird_pipeline.py
 ```
 
-Scans `data/raw/`, extracts and caches YAMNet embeddings, trains the classification head, and writes the model, label map, and test predictions to `outputs/yamnet/`.
+Reads `ml_cv_fold1_train/val.csv` and `ml_test.csv`, locates audio under the mounted BirdCLEF yearly dataset directories, extracts and caches YAMNet embeddings, trains the classification head, and writes the model, label map, and test predictions to `outputs/yamnet/`.
 
 ### 6.2 Run the noise-robustness experiment
 
@@ -156,39 +153,37 @@ The unified harness treats all three models identically. Each model ultimately p
 
 ---
 
-## 8. Current Results (preliminary)
+## 8. Current Results
 
-Preliminary results on a small, class-balanced evaluation subset (4 species, 63 clips, 10-clip held-out test set). Full-dataset figures will replace these once the complete dataset is processed; the qualitative trends are expected to hold.
+YAMNet has been trained end-to-end on the full BirdCLEF data on Kaggle (1,229 species; fold1: 3,824 train / 956 val / 1,196 test). The low absolute accuracy is dictated by the long-tailed distribution — 1,229 species × ~3 samples per class — not by a bug; the assignment focuses on the **relative decay trend** across the three models under noise, not on absolute scores.
 
 **Clean-condition performance (YAMNet):**
 
 | Metric | Value |
 |---|---|
-| Accuracy | 0.90 |
-| Macro-F1 | 0.90 |
-| Weighted-F1 | 0.90 |
-
-The single clean-condition error is a `northern_cardinal` clip misclassified as `house_sparrow`, indicating these two acoustically similar species form the primary confusable pair.
+| Accuracy | 0.0209 (25/1196, ~25× the random baseline of 1/1229 ≈ 0.00081) |
+| Macro-F1 | 0.0150 |
+| Weighted-F1 | 0.0186 |
 
 **Noise-robustness decay (YAMNet):**
 
 | SNR tier | Accuracy |
 |---|---|
-| clean | 0.90 |
-| 5 dB | 0.50 |
-| 0 dB | 0.30 |
-| −5 dB | 0.20 |
+| clean | 0.0209 |
+| 5 dB | 0.0059 |
+| 0 dB | 0.00084 (≈ random baseline; the model effectively fails) |
+| −5 dB | 0.00167 |
 
-Accuracy decays monotonically with noise strength. At the heaviest noise tier (−5 dB) the classifier collapses to a single output class for all inputs, indicating that robustness to strong noise is the limiting factor and motivating future denoising front-ends.
+Accuracy decays monotonically with noise strength, collapsing to the random level at 0 dB, indicating that robustness to strong noise is the primary bottleneck and motivating future denoising front-ends.
 
 ---
 
 ## 9. Limitations & Future Work
 
-- **Sample size**: preliminary numbers are computed on a small held-out set; statistical confidence will improve with the full dataset.
+- **Long-tailed few-shot**: 1,229 species × ~3 training samples per class cause clear overfitting; clean accuracy is only 2.09%. Long-tail mitigation (class weighting, focal loss) is the main direction for improvement.
 - **Noise model**: Gaussian white noise is a controlled baseline; substituting real wind/rain noise is a drop-in change to the noise module.
 - **Fine-tuning**: only the YAMNet classification head is trained; end-to-end fine-tuning of the top convolutional blocks is the natural next step for higher clean-condition accuracy.
-- **Class imbalance**: the current subset is balanced; long-tail mitigation (class weighting, focal loss) will be evaluated on the full long-tailed distribution.
+- **Reproducibility**: only the sklearn split currently uses a fixed seed; TF random seeds are unset, so retraining yields a different model. Adding deterministic seeds would align the numbers.
 
 ---
 
