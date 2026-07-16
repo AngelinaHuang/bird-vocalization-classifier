@@ -144,27 +144,33 @@ results/yamnet/
 
 ## 6. 已知风险 / 待观察
 
-1. **1229 类只 3.1 样本/类**：过拟合，准确率低（clean 5 折均值=1.59%），非 bug。已实跑确认。
+1. **1229 类只 3.1 样本/类**：过拟合，准确率低（clean 5 折均值=1.59%），非 bug。已实跑确认。LightGBM 同款结果（0.48%）也印证了数据约束是主因。
 2. **2026 iNat 音频**目录结构无法提前核实，预检会列缺失，剔除后不影响跑通。实跑未见大面积缺失。
 3. **embedding 缓存匹配逻辑**：`build_embeddings_for_splits` 读缓存按 filename 判断，filename 集合变化时补算缺失项。实跑命中正常。
 4. **noise_robustness_eval 依赖 `test_filenames` 顺序**与 `df_test` 行顺序一致——实跑通过，`noise_results.npz` 产出正常。
 5. **训练不可复现**：每折设了 `tf.random.set_seed(SEED+fold)` 等种子（best-effort），已在 5 折中生效。
 6. **5 折交叉验证已完成（2026-07-14）**：见 §5.0。产物在 `results/yamnet/`。
-7. **下游对比未做**：LightGBM / FastAI 的同款噪声结果还没拿到，三者叠加衰减曲线待补。队友需提供数据清单见 §9。
-8. **多策略微调待做**：当前只实现了"冻结编码器 + 训练分类头"一种策略。proposal 要求"多策略微调"，需补端到端微调（解冻 YAMNet 顶层卷积块）。方案见 §9。
+7. **下游对比**：LightGBM 结果已拿到（0.48% clean），FastAI 的结果待队友完成。三者叠加衰减曲线待补。队友需提供数据清单见 §8。
+8. **端到端微调已实现（2026-07-16）**：代码在 `src/yamnet_finetune_e2e.py` + `noise_eval_e2e.py` + `measure_inference_e2e.py`，待 Kaggle 实跑。详见 §9。
+9. **端到端显存风险**：batch_size=8 时如果 OOM 可降到 4。YAMNet 前向 + 反向传播占显存较大。
+10. **端到端训练时间**：预计 30-60 min/fold，5 折 2.5-5 小时，Kaggle 12h session 限制够用。
 
 ## 7. 接续排查时的建议
 
 - 用户每次贴报错，先看是不是数据没接上（看「挂载自检」「音频发现」「CSV」打印段）。
 - 若 embedding 卡住，确认 GPU/Internet 开了，且 YAMNet 下载成功。
 - 若某年份音频大面积缺失，让用户贴 `ls /kaggle/input/competitions/birdclef-20XX/` 真实结构，再扩 `AUDIO_ROOT_CANDIDATES` 或候选路径。
-- **notebook 跑法**：四个 `.py` 在 Kaggle 单 notebook 里按顺序跑：
+- **notebook 跑法（策略一：冻结，已跑完）**：四个 `.py` 在 Kaggle 单 notebook 里按顺序跑：
   1. cell1: pipeline（`main()` 现跑 5 折训练）
   2. cell2: unified_evaluation（**注释掉 `demo()`**，只定义函数）
   3. cell3: noise_robustness_eval（`__main__` 现调 `main_cv()`，5 折噪声评估）
-  4. **cell4（新增）**: `%run -i src/measure_inference.py`（推理速度 + 显存测量）
-  `noise_robustness_eval` 和 `measure_inference` 开头有 try/except 兼容层：能 import 就 import，import 不到就复用前序 cell 已定义的命名空间。
+  4. cell4: `%run -i src/measure_inference.py`（推理速度 + 显存测量）
+- **notebook 跑法（策略二：端到端微调，待跑）**：三个 cell，**与策略一独立，不需先跑策略一**：
+  1. cell1: `%run -i src/yamnet_finetune_e2e.py`（5 折端到端训练，30-60 min/fold）
+  2. cell2: `%run -i src/noise_eval_e2e.py`（噪声评估，波形直通 e2e 模型）
+  3. cell3: `%run -i src/measure_inference_e2e.py`（推理速度 + 显存）
 - **不想重训时**：注释掉 cell1 的 `if __name__=="__main__": main()`，只定义函数；cell3/4 直接读 `/kaggle/working/yamnet/` 里的现成模型 + 缓存。先 `ls` 确认产物在不在。
+- **端到端 OOM 处理**：如果训练时显存不足，把 `FinetuneConfig.BATCH_SIZE` 从 8 改到 4。
 - **训练不可复现**：代码只给 sklearn 的 split 设了 `SEED=42`，没设 `tf.random.set_seed`/`np.random.seed`/`PYTHONHASHSEED`，重训必得不同模型。若要可复现需补确定性种子（用户尚未决定是否做）。
 - 代码改动遵循：先解释再动手（用户要求），改前可用 EnterPlanMode 列计划。
 - 本地无 tensorflow（有 numpy/pandas/matplotlib/seaborn/sklearn），验证只能 `python -m py_compile` + 抽逻辑单测；出图/读 npz 可本地做。
@@ -213,63 +219,60 @@ SNR 公式:    SNR_dB = 10 × log₁₀(P_signal / P_noise)
 
 ---
 
-## 9. 多策略微调：端到端微调方案
+## 9. 端到端微调（已实现，待 Kaggle 实跑）
 
 ### 当前策略 vs 端到端策略
 
-| | 策略一（当前，已完成） | 策略二（待做） |
+| | 策略一（已完成） | 策略二（已实现，待跑） |
 |---|---|---|
 | 做法 | 冻结 YAMNet → 预计算嵌入 → 训分类头 | 解冻 YAMNet 顶层 → 音频直通 → 联合训练 |
-| YAMNet 参数 | 0 可训练 | 顶层卷积块可训练 |
-| 输入 | 1024 维向量（预计算） | 原始波形 |
+| YAMNet 参数 | 0 可训练 | 全部可训练 (差分学习率保护) |
+| 输入 | 1024 维向量（预计算） | 原始波形 (16000×5) |
 | 每轮计算 | 极快（读缓存） | 慢（每批要过 YAMNet） |
-| 显存 | 极小 | 较大（需 GPU） |
+| 显存 | 极小 | 较大（需 GPU, batch=8） |
 | 拟合能力 | 弱（只调分类头） | 强（可调整特征提取） |
+| 增强 | 无 | MixUp (alpha=0.2) + 类别平衡权重 |
+| 训练循环 | model.fit | 自定义 E2ETrainer (差分学习率) |
 
-### 端到端微调的原理
+### 实现的三个新文件
 
-YAMNet 内部结构（简化）：
+| 文件 | 说明 |
+|---|---|
+| `src/yamnet_finetune_e2e.py` | 端到端微调主管道 (5 折 CV + MixUp + 差分学习率) |
+| `src/noise_eval_e2e.py` | 端到端模型噪声评估 (波形直通, 不用嵌入缓存) |
+| `src/measure_inference_e2e.py` | 端到端推理速度测量 |
+
+### 关键设计
+
+1. **差分学习率**: YAMNet 变量用 lr=1e-5, 分类头用 lr=1e-3, 通过两个 Adam optimizer 分别 apply_gradients
+2. **MixUp**: 每批随机混合两条波形 (Beta(0.2,0.2)), 标签按比例混合, 长尾分类关键技巧
+3. **波形缓存**: `waveforms_cache.npz` 缓存预处理后的波形, 避免每 epoch 重复磁盘 I/O, 跨折复用
+4. **输出隔离**: 存入 `e2e/fold{N}/` 不覆盖旧版冻结产物, 便于直接对比
+
+### Kaggle 运行方式 (3 个 cell)
 
 ```
-原始波形 →  mel-spectrogram  →  卷积层1..N  →  1024维嵌入  →  AudioSet分类(521类)
-                                 ↑ 这里参数可解冻        ↑ 我们替换为 1229 类鸟鸣分类
+cell1: %run -i src/yamnet_finetune_e2e.py       # 训练 + 测试预测 (30-60 min/fold)
+cell2: %run -i src/noise_eval_e2e.py             # 噪声评估 (4 档 SNR × 5 折)
+cell3: %run -i src/measure_inference_e2e.py      # 推理速度 + 显存
 ```
 
-关键操作：
-1. **把 YAMNet 当作 Keras 层**加载（`hub.KerasLayer`），而不是直接调 `model(waveform)` 取嵌入
-2. **解冻最后几个卷积块**（比如最后 10-20 层），让它们可以随训练更新
-3. **差分学习率**：底层（靠近输入）用小学习率，顶层和分类头用大学习率，避免破坏预训练知识
-4. **输入从嵌入换成原始波形**，YAMNet 前向传播 + 分类头一起端到端训练
+### 超参数 (FinetuneConfig)
 
-### 实现要点
+| 参数 | 值 | 说明 |
+|---|---|---|
+| BATCH_SIZE | 8 | YAMNet 前向占显存大 |
+| EPOCHS | 40 | 早停 patience=8 |
+| HEAD_LR | 1e-3 | 分类头学习率 |
+| TOP_LAYER_LR | 1e-5 | YAMNet 顶层学习率 |
+| MIXUP_ALPHA | 0.2 | MixUp Beta 分布参数 |
+| UNFREEZE_LAYERS | 6 | 解冻 YAMNet 顶层层数 (仅供参考, 实际整体解冻+差分lr) |
 
-```python
-# 1. 加载 YAMNet 为可训练 Keras 层
-yamnet_layer = hub.KerasLayer(YAMNET_HANDLE, trainable=True)
+### 预期结果
 
-# 2. 构建端到端模型
-input_wav = tf.keras.Input(shape=(16000 * 5,), dtype=tf.float32)  # 5秒音频
-scores, embeddings, _ = yamnet_layer(input_wav)
-# embeddings shape: [batch, num_frames, 1024]
-avg_emb = tf.reduce_mean(embeddings, axis=1)  # -> [batch, 1024]
-x = tf.keras.layers.Dense(256, activation="relu")(avg_emb)
-x = tf.keras.layers.Dropout(0.3)(x)
-output = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
-model = tf.keras.Model(inputs=input_wav, outputs=output)
-
-# 3. 差分学习率: 底层卷积用 1e-5, 分类头用 1e-3
-# (Keras 中通过 layer.trainable + 分组 optimizer 实现)
-```
-
-### 挑战
-
-- **训练慢很多**：每批都要过完整的 YAMNet（约 80M 参数），不能再用预计算嵌入缓存
-- **需要 GPU**：Kaggle 的 GPU 够用，但显存可能紧张（batch_size 要调到 4-8）
-- **容易过拟合**：1229 类每类 3 样本，解冻后参数更多，early stopping 和 dropout 要更激进
-
-### 建议
-
-先确认老师是否真的要"多策略"——如果三种算法（LightGBM/FastAI/YAMNet）的对比已经算"多策略"，那就不需要补。如果确认需要补，这个端到端微调版本大约需要 Kaggle GPU 上跑 30-60 分钟，我可以帮你改代码。
+- clean 准确率: 预期 3-8% (旧版 1.91%), 解冻后特征提取可适配鸟鸣
+- 噪声衰减: MixUp 增强应使噪声下表现更平缓
+- 推理速度: 预期 80-120 ms/条 (与旧版 86 ms 接近, 因分类头结构不变)
 
 ---
 
@@ -282,6 +285,9 @@ model = tf.keras.Model(inputs=input_wav, outputs=output)
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\unified_evaluation.py` | 统一评估框架（模型无关，待三方数据填入） |
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\measure_inference.py` | 🆕 推理速度测量（Kaggle cell4，5 折 mean±std） |
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\measure_inference_template.py` | 🆕 队友推理速度模板（改三个函数即可用） |
+| `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\yamnet_finetune_e2e.py` | 🆕 端到端微调主管道（解冻 YAMNet + MixUp + 差分学习率） |
+| `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\noise_eval_e2e.py` | 🆕 端到端模型噪声评估 |
+| `E:\stevensprogram\MLwork\YAMNet-kaggle\YAMNet\src\measure_inference_e2e.py` | 🆕 端到端推理速度测量 |
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\results\yamnet\cv_summary.csv` | 5 折汇总 mean±std（clean + 噪声） |
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\results\yamnet\fold1..5\` | 5 折独立产物（模型/预测/噪声结果） |
 | `E:\stevensprogram\MLwork\YAMNet-kaggle\results\yamnet\make_figures.py` | 本地出图脚本（已更新为 5 折 mean±std 版） |

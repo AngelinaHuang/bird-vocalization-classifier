@@ -1,0 +1,262 @@
+"""
+Cell 3: FastAI 测试集噪声鲁棒性、推理速度与显存测定
+=============================================================
+功能包含：
+  1. 噪声鲁棒性 (Noise Robustness): 对 ml_test.csv 进行干净、5dB、0dB、-5dB 的加性高斯白噪声测试。
+  2. 推理速度 (Inference Latency): 预热 5 次，端到端测试 50 次，输出 ms/条。
+  3. 显存监控 (VRAM Peak): 捕获并汇报模型在显卡上的峰值占用。
+"""
+
+import os
+import gc
+import csv
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import librosa
+import matplotlib.pyplot as plt
+from fastai.vision.all import load_learner
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 0. 路径与配置设定 (无缝承接 Cell 2)
+# ============================================================
+MODEL_NAME = "FastAI (ResNet34)"
+OUT_DIR = Path("/kaggle/working/fastai")
+
+# 自动发现 bird-metadata 数据集挂载位置
+def _find_input_dir():
+    kaggle_input = Path("/kaggle/input")
+    if not kaggle_input.exists():
+        return Path("/kaggle/input")
+    # 优先匹配直接挂载的 bird-metadata
+    direct = kaggle_input / "bird-metadata"
+    if direct.exists():
+        return direct
+    # 递归搜索 datasets/*/bird-metadata (Kaggle 常见挂载结构)
+    for p in kaggle_input.glob("**/bird-metadata"):
+        if p.is_dir():
+            return p
+    return kaggle_input
+
+IN_DIR = _find_input_dir()
+TEST_CSV = IN_DIR / "ml_test.csv"
+
+# 测速配置
+N_SAMPLES = 50
+N_WARMUP = 5
+# 噪声配置
+SNR_TIERS = ["clean", "5dB", "0dB", "-5dB"]
+
+# ============================================================
+# 1. 核心工具函数
+# ============================================================
+def resolve_audio_path(row):
+    """自动探寻只读区域的物理音频文件"""
+    fname = str(row['filename'])
+    primary_label = str(row['primary_label'])
+    
+    candidates = []
+    base_search = Path("/kaggle/input")
+    if base_search.exists():
+        for dataset_dir in base_search.iterdir():
+            if dataset_dir.is_dir():
+                for audio_root in ["train_audio", "train_short_audio"]:
+                    candidates.append(dataset_dir / audio_root / fname)
+                    candidates.append(dataset_dir / audio_root / primary_label / fname)
+                    
+        for year in ["2021", "2022", "2023", "2024", "2025", "2026"]:
+            candidates.append(base_search / f"{year}_train_audio" / fname)
+            candidates.append(base_search / f"{year}_train_audio" / primary_label / fname)
+            
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+def waveform_to_temp_img(y, sr, save_path):
+    """(端到端组成部分) 将 1D 波形转成 Mel 声谱图图像存入缓存"""
+    max_samples = int(sr * 5.0)
+    
+    # 定长处理
+    if len(y) > max_samples:
+        start = (len(y) - max_samples) // 2
+        y = y[start:start + max_samples]
+    else:
+        y = np.pad(y, (0, max_samples - len(y)), mode='constant')
+        
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, n_fft=1024, hop_length=512)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    
+    fig = plt.figure(figsize=(3, 3), dpi=100)
+    plt.imshow(mel_db, origin='lower', cmap='viridis')
+    plt.axis('off')
+    plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    
+    fig.clf()
+    plt.close('all')
+    return save_path
+
+def add_gaussian_noise(waveform, snr_db, rng):
+    """叠加高斯白噪声并进行峰值归一化 [-1, 1]"""
+    if snr_db == "clean":
+        return waveform
+        
+    signal_power = np.mean(waveform ** 2)
+    if signal_power == 0:
+        return waveform
+        
+    snr_value = float(snr_db.replace("dB", ""))
+    noise_power = signal_power / (10 ** (snr_value / 10))
+    
+    noise = rng.normal(0, np.sqrt(noise_power), len(waveform)).astype(np.float32)
+    noisy_wf = waveform + noise
+    
+    # 峰值归一化
+    max_val = np.max(np.abs(noisy_wf))
+    if max_val > 0:
+        noisy_wf = noisy_wf / max_val
+        
+    return noisy_wf
+
+# ============================================================
+# 2. 评估主管道
+# ============================================================
+def main_eval():
+    print(f"=== 加载 FastAI 模型 ===")
+    model_path = OUT_DIR / "fold1" / "fastai_bird_model.pkl"
+    if not model_path.exists():
+        raise FileNotFoundError(f"未找到训练好的模型，请确认 Cell 2 是否执行成功 ({model_path})")
+        
+    learn = load_learner(model_path)
+    vocab = list(learn.dls.vocab)
+    
+    df_test = pd.read_csv(TEST_CSV)
+    print(f"测试集共 {len(df_test)} 条记录。\n")
+    
+    # --------------------------------------------------------
+    # 任务 A: 推理测速与显存占用 (Inference & VRAM)
+    # --------------------------------------------------------
+    print(f"{'='*50}\n[任务 A] 端到端推理速度与 GPU 显存测定\n{'='*50}")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+    temp_infer_img = OUT_DIR / "temp_infer.png"
+    n_test = min(N_SAMPLES, len(df_test))
+    times_ms = []
+    
+    print(f"正在进行 {N_WARMUP} 次测速预热...")
+    sample_audio = resolve_audio_path(df_test.iloc[0])
+    wf, sr = librosa.load(sample_audio, sr=16000, mono=True)
+    wf = librosa.util.normalize(wf) if len(wf) > 0 else np.zeros(16000 * 5, dtype=np.float32)
+    for _ in range(N_WARMUP):
+        waveform_to_temp_img(wf, sr, temp_infer_img)
+        with learn.no_bar(), learn.no_logging():
+            learn.predict(temp_infer_img)
+            
+    print(f"正式测量 {n_test} 条样本 (包含物理读图、特征提取、预测)...")
+    for i in range(n_test):
+        audio_path = resolve_audio_path(df_test.iloc[i])
+        
+        # 计时开始 (端到端)
+        t0 = time.perf_counter()
+        
+        w_cur, sr_cur = librosa.load(audio_path, sr=16000, mono=True)
+        w_cur = librosa.util.normalize(w_cur) if len(w_cur) > 0 else np.zeros(16000 * 5, dtype=np.float32)
+        waveform_to_temp_img(w_cur, sr_cur, temp_infer_img)
+        with learn.no_bar(), learn.no_logging():
+            learn.predict(temp_infer_img)
+            
+        times_ms.append((time.perf_counter() - t0) * 1000)
+        if (i+1) % 10 == 0:
+            print(f"  已完成测速 {i+1} / {n_test}")
+
+    times_arr = np.array(times_ms)
+    gpu_peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0
+    
+    print(f"\n>> 平均端到端延迟: {times_arr.mean():.1f} ± {times_arr.std():.1f} ms/条")
+    print(f">> GPU 峰值显存 : {gpu_peak_mb:.1f} MB" if gpu_peak_mb else ">> GPU 显存: 未使用 CUDA")
+
+    metrics = {
+        "model": MODEL_NAME,
+        "e2e_mean_ms": round(times_arr.mean(), 1),
+        "e2e_std_ms": round(times_arr.std(), 1),
+        "gpu_memory_peak_mb": round(gpu_peak_mb, 1) if gpu_peak_mb else None,
+        "n_samples": n_test,
+        "n_warmup": N_WARMUP
+    }
+    
+    with open(OUT_DIR / "inference_metrics.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=metrics.keys())
+        writer.writeheader()
+        writer.writerow(metrics)
+
+    # --------------------------------------------------------
+    # 任务 B: 噪声鲁棒性 (Noise Robustness Decay)
+    # --------------------------------------------------------
+    print(f"\n{'='*50}\n[任务 B] 注入高斯白噪声鲁棒性评估\n{'='*50}")
+    
+    rng = np.random.default_rng(42)
+    temp_noise_img = OUT_DIR / "temp_noise.png"
+    
+    pred_by_snr = {snr: [] for snr in SNR_TIERS}
+    y_true_list = []
+    
+    print("正在为全部测试集注入物理声波噪声，耗时较长请耐心等待...")
+    for i, row in df_test.iterrows():
+        primary_label = row['primary_label']
+        y_true_idx = vocab.index(primary_label) if primary_label in vocab else -1
+        y_true_list.append(y_true_idx)
+        
+        audio_path = resolve_audio_path(row)
+        if audio_path is None:
+            # 物理文件缺失时的安全处理
+            for snr in SNR_TIERS: pred_by_snr[snr].append(-1)
+            continue
+            
+        clean_wf, sr = librosa.load(audio_path, sr=16000, mono=True)
+        clean_wf = librosa.util.normalize(clean_wf) if len(clean_wf) > 0 else np.zeros(16000 * 5, dtype=np.float32)
+        
+        # 将原始波形在 4 个信噪比下分别渲染、预测
+        for snr in SNR_TIERS:
+            noisy_wf = add_gaussian_noise(clean_wf, snr, rng)
+            waveform_to_temp_img(noisy_wf, sr, temp_noise_img)
+            
+            with learn.no_bar(), learn.no_logging():
+                _, pred_idx, _ = learn.predict(temp_noise_img)
+            pred_by_snr[snr].append(int(pred_idx))
+            
+        # 防止 Kaggle 内存堆积崩溃
+        if (i+1) % 50 == 0:
+            gc.collect()
+            print(f"  已完成噪声衰减渲染样本 {i+1} / {len(df_test)}")
+
+    y_true_arr = np.array(y_true_list)
+    print("\n[噪声衰减准确率 (Accuracy Decay)]")
+    for snr in SNR_TIERS:
+        preds = np.array(pred_by_snr[snr])
+        acc = float(np.mean(preds == y_true_arr))
+        print(f"  >>> SNR [{snr}] 准确率 = {acc:.4f}")
+        
+    # 保存所有的噪声测试记录，完美对接绘图脚本 unified_evaluation.py
+    np.savez(
+        OUT_DIR / "noise_results.npz",
+        y_true=y_true_arr,
+        pred_clean=pred_by_snr["clean"],
+        pred_5dB=pred_by_snr["5dB"],
+        pred_0dB=pred_by_snr["0dB"],
+        pred_minus5dB=pred_by_snr["-5dB"],
+        classes=np.array(vocab)
+    )
+    print(f"\n[完成] 噪声预测结果已存入 {OUT_DIR / 'noise_results.npz'}")
+
+if __name__ == "__main__":
+    main_eval()

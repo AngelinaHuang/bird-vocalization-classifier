@@ -1,0 +1,65 @@
+1. MixUp（最推荐）
+# FastAI: 已经内置 mixup 参数
+learn = Learner(dls, model, loss_func=CrossEntropyLossLoss(), cbs=MixUp(0.4))
+
+# YAMNet (Keras): 训练时手动混合
+for x, y in train_ds:
+    lam = np.random.beta(0.2, 0.2)
+    idx = np.random.permutation(len(x))
+    x_mix = lam * x + (1-lam) * x[idx]
+    y_mix = lam * y + (1-lam) * y[idx]
+
+2. Class-Balanced Loss
+# LightGBM: 已有参数
+lgb.train(params, ..., class_weight=balanced)  # sklearn 风格
+
+# YAMNet:
+from sklearn.utils.class_weight import compute_class_weight
+cw = compute_class_weight('balanced', classes=np.unique(y), y=y)
+model.compile(loss=sparse_categorical_crossentropy(cw))
+
+3. SpecAugment（FastAI 方向）
+你们已有时间掩蔽和频率掩蔽的概念，但可以确保实现的是 Google 原版 SpecAugment 的完整版本（多个时间/频率条带掩蔽）。
+
+方案四：筛选常见物种子集做"实用准确率"评估
+
+这不是放弃 1229 类，而是加一个补充评估维度：
+
+全量评估：1229 类 × 4 样本/类 → 证明覆盖度和方法可扩展性
+子集评估：Top-50 物种 × ≥20 样本/类 → 证明方法在实际场景下的有效性
+
+在子集上，你们的准确率应该能达到 20-40%，这就足以和 BirdNET 在可比条件下对比了。
+
+---
+优先级排序（投入产出比）
+
+必做（没有这个项目不完整）：
+  1. 跑 BirdNET 基线（同测试集 + 同噪声条件）   ← 这是"比 BirdNET 更好"的前提
+  2. 扩大数据集（每类 ≥20 样本）                 ← 3.9→20+ 样本/类
+
+强烈建议（代码改动小，提升大）：
+  3. MixUp 增强（三模型都加）
+  4. Class-Balanced Loss（三模型都加）
+  5. YAMNet 端到端微调（HANDOFF.md 已有方案）
+
+锦上添花：
+  6. Top-50 物种子集评估（补充维度）
+  7. FastAI 结果出来后三方对比
+
+---
+"比 BirdNET 更好"的完整故事线
+
+有了上面的改动后，你们可以这样讲：
+
+▎ "BirdNET 在 clean 条件下准确率高（它在几十万条数据上训练），但在 SNR ≤ 0dB 时性能急剧下降，且缺乏标准化的可控噪声评估管线。
+▎
+▎ 我们在统一数据集上对比了三种异构 ML 范式，配合双阶段数据增强和类别平衡损失，在相同噪声测试条件下展示：
+▎ 1. 噪声衰减曲线比 BirdNET 更平缓（尤其在 0dB 和 -5dB 下）
+▎ 2. 配合 MixUp 增强的模型在低 SNR 下保持更高的相对准确率
+▎ 3. 三种范式的噪声鲁棒性排序：YAMNet 迁移学习 > FastAI CNN > LightGBM
+▎ 4. 这是首个在标准化噪声条件下系统对比三种异构算法 + BirdNET 基线的工作"
+
+这个故事的成立完全取决于方案一（跑 BirdNET 基线）——没有同台对比，"比 BirdNET 更好"就只是文献引用而非实证结论。
+
+---
+需要我帮你实现哪一步？我建议从跑 BirdNET 基线和扩大数据集开始，这两个见效最快。
