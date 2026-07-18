@@ -1,0 +1,253 @@
+"""
+FastAI 迁移学习鸟鸣分类管道 (Kaggle 适配版)
+负责人: jincheng chen
+
+完全兼容 Data Processing Doc 规范中的 5 折交叉验证与独立测试集评估。
+已将环境配置入口规范绝对统一，支持本地及 Kaggle 环境的自动路径分配。
+
+"""
+import os
+import gc
+import random 
+import warnings
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pandas as pd
+import librosa
+import cv2  
+from sklearn.metrics import accuracy_score
+
+import timm 
+from fastai.vision.all import *
+from fastai.callback.mixup import MixUp
+from fastai.losses import FocalLossFlat
+from tqdm.auto import tqdm
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 1. 配置项与环境初始化
+# ============================================================
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+seed_everything(42)
+
+if torch.cuda.is_available():
+    print(f"✅ GPU 就绪: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+else:
+    print("⚠️ 未检测到 GPU")
+
+class Config:
+    SAMPLE_RATE = 16000
+    CLIP_SECONDS = 5.0
+    N_MELS = 128
+    IMAGE_SIZE = (224, 224)
+    N_FOLDS = 5
+
+    @staticmethod
+    def _find_csv_dir():
+        kaggle_input = Path("/kaggle/input")
+        if not kaggle_input.exists(): return Path("../../data/data")
+        direct = kaggle_input / "fulldataset" 
+        if direct.exists(): return direct
+        for p in kaggle_input.glob("**/fulldataset"): 
+            if p.is_dir(): return p
+        return Path("../../data/data")
+
+    CSV_DIR = _find_csv_dir.__func__()
+    TEST_CSV = "03_test_holdout.csv"             
+
+    @staticmethod
+    def fold_csvs(fold: int):
+        return (f"cv_fold{fold}_train.csv", f"cv_fold{fold}_val.csv")
+
+    @classmethod
+    def fold_dir(cls, fold: int):
+        return cls.OUT_DIR / f"fold{fold}"
+
+    KAGGLE_INPUT = Path("/kaggle/input")
+
+    @staticmethod
+    def _default_out_dir():
+        if Path("/kaggle/working").exists():
+            return Path("/kaggle/working/fastai")
+        return Path("../outputs/fastai")
+
+    OUT_DIR = _default_out_dir.__func__()
+    IMG_DIR = OUT_DIR / "processed/fastai_spectrograms" 
+    LABEL_MAP_PATH = OUT_DIR / "label_map.json"
+
+Config.IMG_DIR.mkdir(parents=True, exist_ok=True)
+Config.OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# 2. 音频特征工程 (RMS能量检测极速版 + OpenCV + 频率截断)
+# ============================================================
+_global_audio_index = {}
+if Config.KAGGLE_INPUT.exists():
+    for audio_path in Config.KAGGLE_INPUT.rglob("*.ogg"):
+        _global_audio_index[audio_path.name] = audio_path
+        relative_key = f"{audio_path.parent.name}/{audio_path.name}"
+        _global_audio_index[relative_key] = audio_path
+
+def resolve_audio_path(row):
+    fname = str(row['filename'])
+    if fname in _global_audio_index: return _global_audio_index[fname]
+    just_name = Path(fname).name
+    if just_name in _global_audio_index: return _global_audio_index[just_name]
+    return None
+
+def audio_to_spectrogram(row):
+    audio_path = resolve_audio_path(row)
+    if audio_path is None: return None
+        
+    safe_img_name = str(row['filename']).replace('/', '_') + ".png"
+    save_path = Config.IMG_DIR / safe_img_name
+    
+    if save_path.exists(): return str(save_path)
+        
+    try:
+        y, sr = librosa.load(audio_path, sr=Config.SAMPLE_RATE, mono=True)
+        frame_length = int(Config.SAMPLE_RATE * Config.CLIP_SECONDS)
+        
+        # 基于 librosa 底层的极速 RMS 能量检测
+        if len(y) > frame_length:
+            hop_length = 512
+            rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop_length)[0]
+            max_idx = np.argmax(rms)
+            
+            center_sample = max_idx * hop_length
+            start = max(0, min(center_sample - frame_length // 2, len(y) - frame_length))
+            y = y[start:start + frame_length]
+        else:
+            y = np.pad(y, (0, frame_length - len(y)), mode='constant')
+            
+        # 【优化 1】：Bandpass Filtering
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=Config.SAMPLE_RATE, n_mels=Config.N_MELS, n_fft=1024, hop_length=512,
+            fmin=500,   # 强制屏蔽 500Hz 以下的低频风声/水流声
+            fmax=8000   # 强制屏蔽 8000Hz 以上的高频白噪
+        )
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        
+        img = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+        img = (img * 255).astype(np.uint8)
+        img = np.flipud(img)
+        img_color = cv2.applyColorMap(img, cv2.COLORMAP_VIRIDIS)
+        img_resized = cv2.resize(img_color, Config.IMAGE_SIZE)
+        
+        cv2.imwrite(str(save_path), img_resized)
+        return str(save_path)
+    except Exception as e:
+        print(f"解析出错 {audio_path}: {e}")
+        return None
+
+def apply_multithread(df):
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        paths = list(tqdm(executor.map(audio_to_spectrogram, df.to_dict('records')), total=len(df)))
+    df['spectrogram_path'] = paths
+    return df
+
+# ============================================================
+# 3. 5 折交叉验证主管道
+# ============================================================
+def main_cv():
+    print(f"\n=== 启动 FastAI 5 折交叉验证 ===")
+    
+    test_csv = Config.CSV_DIR / Config.TEST_CSV
+    df_test = pd.read_csv(test_csv)
+    print("正在预处理独立测试集 (Test Set)...")
+    df_test = apply_multithread(df_test)
+    df_test = df_test.dropna(subset=['spectrogram_path']).reset_index(drop=True)
+    
+    clean_accs = []
+    
+    for fold in range(1, Config.N_FOLDS + 1):
+        print(f"\n========== [Fold {fold}] 训练开始 ==========")
+        fold_out = Config.fold_dir(fold)
+        fold_out.mkdir(parents=True, exist_ok=True)
+        
+        train_name, val_name = Config.fold_csvs(fold)
+        df_fold = pd.concat([
+            pd.read_csv(Config.CSV_DIR / train_name).assign(is_valid=False),
+            pd.read_csv(Config.CSV_DIR / val_name).assign(is_valid=True)
+        ], ignore_index=True)
+        
+        print(f"  > 提取当前 Fold 图像特征 (带缓存)...")
+        df_fold = apply_multithread(df_fold)
+        df_fold = df_fold.dropna(subset=['spectrogram_path']).reset_index(drop=True)
+            
+        all_labels = sorted(list(set(df_fold['primary_label'].unique()) | set(df_test['primary_label'].unique())))
+        
+        birds_db = DataBlock(
+            blocks=(ImageBlock, CategoryBlock(vocab=all_labels)),
+            get_x=ColReader('spectrogram_path'),
+            get_y=ColReader('primary_label'),
+            splitter=ColSplitter('is_valid'),
+            item_tfms=[], 
+            batch_tfms=[
+                Normalize.from_stats(*imagenet_stats),
+                RandomErasing(p=0.4, sl=0.05, sh=0.15) 
+            ]
+        )
+        
+        dls = birds_db.dataloaders(df_fold, bs=32, num_workers=4) 
+        classes = list(dls.vocab)
+        
+        if fold == 1:
+            with open(Config.LABEL_MAP_PATH, "w") as f:
+                json.dump({name: idx for idx, name in enumerate(classes)}, f, indent=4)
+        
+        print(f"  > 初始化 ConvNeXt-Small 与高级训练策略...")
+        
+        # 【优化 2】：convnext_small
+        learn = vision_learner(
+            dls, 
+            'convnext_small', 
+            metrics=[accuracy, F1Score(average='macro')], 
+            loss_func=FocalLossFlat(gamma=2.0), 
+            cbs=[MixUp(alpha=0.4)],         
+            path=fold_out
+        ).to_fp16()
+        
+        print(f"  > 开始微调: 3轮预热 + 12轮深层训练...")
+        learn.fine_tune(epochs=12, base_lr=2e-3, freeze_epochs=3)
+        
+        learn.export(fold_out / "fastai_bird_model.pkl")
+        
+        print(f"  > 正在对独立测试集进行预测...")
+        test_dl = learn.dls.test_dl(df_test, with_labels=True)
+        preds, targets = learn.get_preds(dl=test_dl)
+        
+        y_prob, y_pred, y_true = preds.numpy(), preds.argmax(dim=1).numpy(), targets.numpy()
+        test_acc = accuracy_score(y_true, y_pred)
+        clean_accs.append(float(test_acc))
+        print(f"  > [结果] Fold {fold} 测试集 Clean 准确率: {test_acc:.4f}\n")
+        
+        np.savez(
+            fold_out / "test_predictions.npz",
+            y_true=y_true, y_pred=y_pred, y_prob=y_prob, 
+            classes=np.array(classes), test_filenames=df_test['filename'].values
+        )
+        
+        del learn, dls, birds_db
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print("\n========== 交叉验证结束 ==========")
+    clean_arr = np.array(clean_accs)
+    pd.DataFrame({"fold": range(1, Config.N_FOLDS + 1), "clean_acc": clean_arr}).to_csv(Config.OUT_DIR / "cv_per_fold.csv", index=False)
+    print(f"[汇总] FastAI 终极版 Clean 准确率: {clean_arr.mean():.4f} ± {clean_arr.std(ddof=1):.4f}")
+
+if __name__ == "__main__":
+    main_cv()
+
