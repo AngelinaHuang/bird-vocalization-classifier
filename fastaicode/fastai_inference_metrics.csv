@@ -1,0 +1,2 @@
+model,inference_e2e_mean_ms,inference_e2e_std_ms,gpu_memory_current_mb,gpu_memory_peak_mb,n_samples,n_warmup,n_folds
+FastAI_ResNet34_Spectrogram,114.6,5.2,362.7,3840.4,50,5,5
