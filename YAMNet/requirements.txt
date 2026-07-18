@@ -1,6 +1,7 @@
 tensorflow>=2.10
 tensorflow-hub
 librosa
+soundfile
 numpy
 pandas
 scikit-learn

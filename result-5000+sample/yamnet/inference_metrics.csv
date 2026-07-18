@@ -1,0 +1,2 @@
+model,inference_e2e_mean_ms,inference_e2e_std_ms,yamnet_encoder_mean_ms,yamnet_encoder_std_ms,head_mean_ms,head_std_ms,gpu_memory_current_mb,gpu_memory_peak_mb,n_samples,n_warmup,n_folds
+YAMNet,86.0,0.6,4.4,0.5,81.6,0.6,86.7,211.4,50,5,5

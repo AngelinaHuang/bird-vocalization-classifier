@@ -24,9 +24,10 @@ This project investigates which modeling paradigm degrades most gracefully as no
 
 ## 2. Dataset
 
-- **Source**: bird vocalization metadata from the Google Perch / BirdCLEF 2021–2026 competitions. The team field-level-deduplicated and dual-layer-stratified-sampled the six annual CSVs into `ml_cv_fold1_train.csv` / `ml_cv_fold1_val.csv` / `ml_test.csv`; audio files are mounted under Kaggle's BirdCLEF yearly dataset directories. **1,229 species** in total.
+- **Source**: bird vocalization metadata from the Google Perch / BirdCLEF 2021–2026 competitions. After field-level deduplication, non-bird taxa (101 species: Amphibia/Insecta/Mammalia/Reptilia) and low-quality recordings (rating ≤ 0.5) are filtered out, yielding **144,250 clean bird recordings** across **1,126 species**. Audio files are mounted under Kaggle's BirdCLEF yearly dataset directories.
 - **Preprocessing**: all clips are resampled to **16 kHz mono**, peak-normalized to **[−1, 1]** in `float32`, and fixed to a uniform length (center-trim or zero-pad).
-- **Splits**: 80/20 stratified train/test split preserving SNR-tier proportions; a 5-fold stratified cross-validation is nested within the training set (YAMNet uses fold1: 3,824 train / 956 val), with a 1,196-sample held-out test set. The split is deterministic (fixed seed) so that the noise-robustness evaluation reuses the exact same test set. See `Data Processing Documentation.md` for details.
+- **Splits**: 90/10 stratified train/test split (SNR-tier aligned), with rare species (<5 recordings) kept entirely in the training pool. Training pool: **129,834 recordings** / 1,126 species; held-out test set: **14,416 recordings** / 1,093 species. A 5-fold SNR-stratified CV is nested within the training set (~103,853 train / ~25,967 val per fold). The split uses fixed seed 42 for deterministic reproducibility. See `data/augmenteddata/Data Augmentation Documentation.md` for details.
+- **Low-resource augmentation**: 159 species with <15 training samples receive on-the-fly audio augmentation (time stretch / pitch shift / noise addition / volume change) to reach a target of 15 effective examples, capped at 50 new variants per species. See `src/e2e/audio_augmentation.py`.
 
 ---
 
@@ -44,13 +45,20 @@ All three are evaluated through a **single unified evaluation harness** so that 
 
 ### 3.2 YAMNet transfer learning (this repository)
 
-The YAMNet pipeline uses the lightweight "precompute-embeddings + train-a-head" strategy:
+This repository implements two strategies, run independently for fair comparison:
 
+**Strategy 1: Frozen embeddings + classification head**
 1. Each waveform is passed through the frozen YAMNet encoder, producing a 1024-dimensional embedding per 0.48 s frame.
 2. Frame embeddings are averaged into a single clip-level 1024-d vector and cached to disk (embeddings are expensive to compute and reused across runs).
 3. A small fully-connected head (`Dense(256, ReLU) → Dropout → Dense(num_classes, softmax)`) is trained on the cached embeddings with early stopping, checkpointing, and on-plateau learning-rate reduction.
+4. Code: `src/yamnet_bird_pipeline.py`
 
-An end-to-end fine-tuning variant (unfreezing the top YAMNet convolutional blocks with differential learning rates) is outlined in `src/yamnet_bird_pipeline.py` as a follow-up.
+**Strategy 2: End-to-end fine-tuning (implemented)**
+1. Top YAMNet convolutional blocks are unfrozen; raw waveforms pass through end-to-end for joint training.
+2. Differential learning rates: YAMNet variables at lr=1e-5, classification head at lr=1e-3.
+3. MixUp augmentation (alpha=0.2) + class-balanced loss weights to mitigate the long tail.
+4. On-the-fly audio augmentation during training: 159 low-resource species (<15 samples) receive dynamically generated variants per CV fold (max 50 per species).
+5. Code: `src/e2e/yamnet_finetune_e2e.py` + `src/e2e/audio_augmentation.py`
 
 ### 3.3 Controlled noise-injection experiment
 
@@ -72,20 +80,33 @@ YAMNet/
 ├── README_zh.md                       # 中文版
 ├── requirements.txt
 ├── .gitignore
+├── HANDOFF.md                         # Troubleshooting & handoff guide
 ├── _inspect.py                        # quick inspection of cached outputs
-├── data/
-│   └── processed/                     # (reserved for future preprocessing)
 ├── src/
-│   ├── yamnet_bird_pipeline.py        # YAMNet embedding extraction + head training
-│   ├── noise_robustness_eval.py       # SNR-tier noise injection + decay measurement
-│   └── unified_evaluation.py          # Model-agnostic metrics + plotting
+│   ├── yamnet_bird_pipeline.py        # Strategy 1: frozen embeddings + head (5-fold CV)
+│   ├── noise_robustness_eval.py       # Strategy 1: SNR-tier noise injection + decay
+│   ├── unified_evaluation.py          # Model-agnostic metrics + plotting
+│   ├── measure_inference.py           # Strategy 1: inference speed + memory
+│   ├── measure_inference_template.py  # Inference measurement template for teammates
+│   └── e2e/                           # Strategy 2: end-to-end fine-tuning
+│       ├── yamnet_finetune_e2e.py     # E2E pipeline (diff lr + MixUp + augmentation)
+│       ├── audio_augmentation.py      # On-the-fly augmentation for low-resource species
+│       ├── noise_eval_e2e.py          # E2E model noise evaluation
+│       └── measure_inference_e2e.py   # E2E inference speed + memory
 └── outputs/
-    ├── yamnet/
-    │   ├── label_map.json             # species <-> integer index mapping
-    │   ├── embeddings.npz             # cached YAMNet embeddings (gitignored)
-    │   ├── yamnet_bird_model.keras    # trained classification head (gitignored)
-    │   ├── test_predictions.npz       # held-out test predictions (gitignored)
-    │   └── noise_results.npz          # per-SNR accuracy + predictions (gitignored)
+    ├── yamnet/                        # Strategy 1 outputs (frozen embeddings)
+    │   ├── label_map.json
+    │   ├── embeddings.npz
+    │   ├── cv_per_fold.csv / cv_summary.csv
+    │   └── fold{1-5}/
+    │       ├── yamnet_bird_model.keras
+    │       ├── test_predictions.npz
+    │       └── noise_results.npz
+    ├── e2e/                           # Strategy 2 outputs (end-to-end)
+    │   └── fold{1-5}/
+    │       ├── yamnet_e2e_model.keras
+    │       ├── test_predictions.npz
+    │       └── noise_results.npz
     └── figures/
         ├── confusion_matrix_YAMNet.png
         └── noise_robustness.png
@@ -101,9 +122,9 @@ cd bird-vocalization-classifier/YAMNet
 pip install -r requirements.txt
 ```
 
-Dependencies: `tensorflow>=2.10`, `tensorflow-hub`, `librosa`, `numpy`, `pandas`, `scikit-learn`, `matplotlib`, `seaborn`.
+Dependencies: `tensorflow>=2.10`, `tensorflow-hub`, `librosa`, `soundfile`, `numpy`, `pandas`, `scikit-learn`, `matplotlib`, `seaborn`.
 
-> YAMNet is downloaded automatically from TensorFlow Hub on first run (~17 MB). No GPU is required for the embedding+head workflow; a CPU is sufficient.
+> YAMNet is downloaded automatically from TensorFlow Hub on first run (~17 MB). Strategy 1 (frozen embeddings + head) works on CPU. Strategy 2 (end-to-end fine-tuning) benefits from a GPU.
 
 ---
 
@@ -115,29 +136,69 @@ All scripts use paths relative to `src/`, so run them from the `src/` directory 
 cd src
 ```
 
-### 6.1 Train the YAMNet classifier
+### 6.1 Strategy 1: Frozen embeddings + classification head
 
 ```bash
 python yamnet_bird_pipeline.py
 ```
 
-Reads `ml_cv_fold1_train/val.csv` and `ml_test.csv`, locates audio under the mounted BirdCLEF yearly dataset directories, extracts and caches YAMNet embeddings, trains the classification head, and writes the model, label map, and test predictions to `outputs/yamnet/`.
+Reads CV split CSVs, locates audio under the mounted BirdCLEF yearly dataset directories, extracts and caches YAMNet embeddings, runs 5-fold CV training, and writes outputs to `outputs/yamnet/`.
 
-### 6.2 Run the noise-robustness experiment
+### 6.2 Strategy 2: End-to-end fine-tuning
 
+```bash
+cd e2e
+python yamnet_finetune_e2e.py
+```
+
+Unfreezes YAMNet top layers, applies differential learning rates + MixUp + on-the-fly audio augmentation, runs 5-fold end-to-end training. Outputs go to `outputs/e2e/` without overwriting Strategy 1 artifacts.
+
+### 6.3 Test audio augmentation (single file)
+
+```bash
+python e2e/audio_augmentation.py <audio_file> [output_dir]
+```
+
+Applies 4 augmentation methods (time stretch / pitch shift / noise addition / volume change) to a single audio file and saves variants. For verification only; training-time augmentation is invoked automatically by `yamnet_finetune_e2e.py`.
+
+### 6.4 Run the noise-robustness experiment
+
+**Strategy 1:**
 ```bash
 python noise_robustness_eval.py
 ```
 
-Reproduces the training-time test split, injects Gaussian noise at 5 / 0 / −5 dB, re-encodes each noisy waveform, and records per-tier accuracy. Results are written to `outputs/yamnet/noise_results.npz` and the decay curve to `outputs/figures/noise_robustness.png`.
+**Strategy 2:**
+```bash
+cd e2e
+python noise_eval_e2e.py
+```
 
-### 6.3 Generate evaluation reports and figures
+Injects Gaussian noise at 5 / 0 / −5 dB, re-encodes each noisy waveform, and records per-tier accuracy. Results are written to `outputs/yamnet/noise_results.npz` (or `outputs/e2e/`) and the decay curve to `outputs/figures/noise_robustness.png`.
+
+### 6.5 Generate evaluation reports and figures
 
 ```bash
 python unified_evaluation.py
 ```
 
 Computes accuracy / precision / recall / F1 (macro and weighted), per-class breakdown, confusion matrix, multi-model accuracy comparison, and the noise-decay curve.
+
+### 6.6 Kaggle Notebook workflow
+
+Strategy 1 (3 cells):
+```
+cell1: %run -i src/yamnet_bird_pipeline.py       # 5-fold CV training
+cell2: %run -i src/noise_robustness_eval.py       # noise evaluation
+cell3: %run -i src/measure_inference.py           # inference speed + memory
+```
+
+Strategy 2 (3 cells, independent from Strategy 1):
+```
+cell1: %run -i src/e2e/yamnet_finetune_e2e.py      # end-to-end training (30-60 min/fold)
+cell2: %run -i src/e2e/noise_eval_e2e.py            # noise evaluation
+cell3: %run -i src/e2e/measure_inference_e2e.py     # inference speed + memory
+```
 
 ---
 
@@ -155,35 +216,46 @@ The unified harness treats all three models identically. Each model ultimately p
 
 ## 8. Current Results
 
-YAMNet has been trained end-to-end on the full BirdCLEF data on Kaggle (1,229 species; fold1: 3,824 train / 956 val / 1,196 test). The low absolute accuracy is dictated by the long-tailed distribution — 1,229 species × ~3 samples per class — not by a bug; the assignment focuses on the **relative decay trend** across the three models under noise, not on absolute scores.
+### Strategy 1 (Frozen embeddings + head) — 5-fold CV
 
-**Clean-condition performance (YAMNet):**
+YAMNet has been trained on the full BirdCLEF data on Kaggle (1,229 species; 5-fold CV). The low absolute accuracy is dictated by the long-tailed distribution — 1,229 species × ~3 samples per class — not by a bug; the assignment focuses on the **relative decay trend** across the three models under noise, not on absolute scores.
 
-| Metric | Value |
-|---|---|
-| Accuracy | 0.0209 (25/1196, ~25× the random baseline of 1/1229 ≈ 0.00081) |
-| Macro-F1 | 0.0150 |
-| Weighted-F1 | 0.0186 |
+**5-fold clean accuracy:**
 
-**Noise-robustness decay (YAMNet):**
+| Metric | Mean ± Std |
+|--------|-----------|
+| Accuracy | 1.59% ± 0.27% |
+| Macro-F1 | — |
+| Weighted-F1 | — |
+
+Per-fold clean accuracy: fold1=1.76%, fold2=1.09%, fold3=1.51%, fold4=1.76%, fold5=1.84%.
+
+**Noise-robustness decay (5-fold mean ± std):**
 
 | SNR tier | Accuracy |
-|---|---|
-| clean | 0.0209 |
-| 5 dB | 0.0059 |
-| 0 dB | 0.00084 (≈ random baseline; the model effectively fails) |
-| −5 dB | 0.00167 |
+|----------|----------|
+| clean | 1.59% ± 0.27% |
+| 5 dB | 0.47% ± 0.16% |
+| 0 dB | 0.30% ± 0.10% (≈ random baseline) |
+| −5 dB | 0.07% ± 0.06% |
 
-Accuracy decays monotonically with noise strength, collapsing to the random level at 0 dB, indicating that robustness to strong noise is the primary bottleneck and motivating future denoising front-ends.
+Accuracy decays monotonically with noise strength, collapsing to the random level at 0 dB, indicating that robustness to strong noise is the primary bottleneck.
+
+### Strategy 2 (End-to-end fine-tuning + V2.0 full data) — pending Kaggle run
+
+The V2.0 dataset (129,834 training recordings / 1,126 species) is ready, and end-to-end fine-tuning code is implemented. Expected improvements:
+- 129K samples substantially mitigate long-tail overfitting; clean accuracy should improve significantly
+- MixUp + audio augmentation should yield flatter noise-decay curves
+- Differential learning rate fine-tuning of YAMNet top layers adapts features to bird vocalizations
 
 ---
 
 ## 9. Limitations & Future Work
 
-- **Long-tailed few-shot**: 1,229 species × ~3 training samples per class cause clear overfitting; clean accuracy is only 2.09%. Long-tail mitigation (class weighting, focal loss) is the main direction for improvement.
+- **Long-tailed few-shot**: The original dataset had 1,229 species × ~3 samples/class, causing severe overfitting. **V2.0 has expanded to 129,834 recordings / 1,126 species**, with sampler weights + class weights + audio augmentation as triple control mechanisms. Pending Kaggle run to verify effectiveness.
 - **Noise model**: Gaussian white noise is a controlled baseline; substituting real wind/rain noise is a drop-in change to the noise module.
-- **Fine-tuning**: only the YAMNet classification head is trained; end-to-end fine-tuning of the top convolutional blocks is the natural next step for higher clean-condition accuracy.
-- **Reproducibility**: only the sklearn split currently uses a fixed seed; TF random seeds are unset, so retraining yields a different model. Adding deterministic seeds would align the numbers.
+- **End-to-end fine-tuning**: Implemented (`yamnet_finetune_e2e.py`), with differential learning rates + MixUp + on-the-fly augmentation. Pending Kaggle run.
+- **Reproducibility**: Both sklearn splits and TF training use fixed seeds; augmentation module has seed control. Re-runs should yield approximately identical results.
 
 ---
 

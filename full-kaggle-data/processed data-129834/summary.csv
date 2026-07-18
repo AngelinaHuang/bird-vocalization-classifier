@@ -1,0 +1,4 @@
+split,rows,species
+bird_full,144250,1126
+train_full,129834,1126
+test_holdout,14416,1093
