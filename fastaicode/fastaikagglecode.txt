@@ -1,0 +1,541 @@
+"""
+FastAI 迁移学习鸟鸣分类管道 (Kaggle 适配版)
+负责人: jincheng chen  |  修改: 接入平衡采样 + 类别加权 + 音频增强 (2026-07-18)
+
+完全兼容 Data Processing Doc 规范中的 5 折交叉验证与独立测试集评估。
+已将环境配置入口规范绝对统一，支持本地及 Kaggle 环境的自动路径分配。
+
+V2 更新 (2026-07-18):
+  - 接入 sampler_weight -> WeightedRandomSampler (平衡采样)
+  - 接入 loss_class_weight -> FocalLossFlat(weight=...) (类别加权)
+  - 接入 augment_for_fastai() (159种低资源物种音频增强, 已内联)
+  - 固定 1,126 类标签空间 (从 02_train_full_weighted.csv 读取)
+  - 单文件自包含: audio_augmentation + augmentation_glue 已揉入本文件
+
+"""
+import os
+import gc
+import random
+import warnings
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pandas as pd
+import librosa
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import torch
+from torch.utils.data import WeightedRandomSampler
+
+import timm
+from fastai.vision.all import *
+from fastai.callback.mixup import MixUp
+from fastai.losses import FocalLossFlat
+from fastai.data.load import TfmdDL
+from tqdm.auto import tqdm
+
+warnings.filterwarnings('ignore')
+
+# ═══════════════════════════════════════════════════════════════
+# 0. 音频增强模块 (内联自 audio_augmentation.py + augmentation_glue.py)
+#    与 YAMNet / LightGBM 共用同一套底层逻辑, 保证可复现
+# ═══════════════════════════════════════════════════════════════
+
+# ── 0.1 单种增强方法 ──
+
+def _time_stretch(y, rate):
+    """时间拉伸: 变速不变调。rate<1 减速, rate>1 加速。"""
+    return librosa.effects.time_stretch(y=y, rate=rate)
+
+def _pitch_shift(y, sr, n_steps):
+    """音高偏移: n_steps 个半音。正值升调, 负值降调。"""
+    return librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps)
+
+def _add_noise(y, snr_db, seed=None):
+    """叠加高斯白噪声, 指定信噪比 (dB)。"""
+    rng = np.random.RandomState(seed) if seed else np.random
+    signal_power = np.mean(y ** 2)
+    noise_power = signal_power / (10 ** (snr_db / 10))
+    noise = rng.randn(len(y)).astype(np.float32) * np.sqrt(noise_power)
+    return (y + noise).astype(np.float32)
+
+def _change_volume(y, gain):
+    """音量缩放: gain<1 减小, gain>1 增大。"""
+    return (y * gain).astype(np.float32)
+
+# ── 0.2 增强方法配置 ──
+
+_AUG_METHODS = {
+    "time_stretch": {
+        "fn": _time_stretch,
+        "params": [0.85, 0.90, 0.95, 1.05, 1.10],
+        "tag": lambda p: f"ts{int(p*100):03d}",
+    },
+    "pitch_shift": {
+        "fn": _pitch_shift,
+        "params": [-2, -1, 1, 2],
+        "tag": lambda p: f"ps{p:+d}",
+        "needs_sr": True,
+    },
+    "noise": {
+        "fn": _add_noise,
+        "params": [5, 10, 15],
+        "tag": lambda p: f"noise{p}db",
+    },
+    "volume": {
+        "fn": _change_volume,
+        "params": [0.70, 0.85, 1.15, 1.30],
+        "tag": lambda p: f"vol{int(p*100):03d}",
+    },
+}
+
+def _augment_waveform(y, sr=16000, methods=None, seed=None):
+    """对单条波形应用一次随机增强。返回 (augmented_y, method_tag)。"""
+    rng = np.random.RandomState(seed) if seed else np.random
+    method_names = list(_AUG_METHODS.keys()) if methods is None else methods
+    name = rng.choice(method_names)
+    info = _AUG_METHODS[name]
+    param = rng.choice(info["params"])
+    if info.get("needs_sr"):
+        aug_y = info["fn"](y, sr, param)
+    else:
+        aug_y = info["fn"](y, param)
+    if len(aug_y) != len(y):
+        aug_y = aug_y[:len(y)] if len(aug_y) > len(y) else np.pad(aug_y, (0, len(y) - len(aug_y)))
+    return aug_y.astype(np.float32), info["tag"](param)
+
+# ── 0.3 DataFrame 扩展: 生成增强样本的元数据行 ──
+
+def _expand_train_df(df_train, low_resource_species, target_per_species=15,
+                      max_aug_per_species=50, seed=42):
+    """为低资源物种生成增强样本的 DataFrame 行 (只生成元数据, 不处理音频)。"""
+    df = df_train.copy()
+    df["_is_augmented"] = False
+    df["_original_filename"] = ""
+    new_rows = []
+    aug_info = []
+    rng = np.random.RandomState(seed)
+
+    for species in low_resource_species:
+        sp_mask = df["primary_label"] == species
+        sp_df = df[sp_mask]
+        current_count = len(sp_df)
+        needed = min(target_per_species - current_count, max_aug_per_species)
+        if needed <= 0:
+            continue
+
+        if needed >= current_count:
+            variants_per_sample = needed // current_count
+            extra = needed % current_count
+            sample_variants = []
+            for i in range(current_count):
+                n = variants_per_sample + (1 if i < extra else 0)
+                n = min(n, 16)
+                sample_variants.append(n)
+        else:
+            chosen_idx = set(rng.choice(current_count, needed, replace=False))
+            sample_variants = [1 if i in chosen_idx else 0 for i in range(current_count)]
+
+        for i, (_, row) in enumerate(sp_df.iterrows()):
+            n_variants = sample_variants[i]
+            if n_variants <= 0:
+                continue
+            original_fn = str(row["filename"])
+            stem = Path(original_fn).stem
+            for v in range(n_variants):
+                new_fn = f"{stem}_aug{v:02d}.wav"
+                new_row = row.to_dict()
+                new_row["filename"] = new_fn
+                new_row["filepath"] = ""
+                new_row["_is_augmented"] = True
+                new_row["_original_filename"] = original_fn
+                new_rows.append(new_row)
+                aug_info.append({
+                    "species": species,
+                    "original_filename": original_fn,
+                    "new_filename": new_fn,
+                    "variant_index": v,
+                })
+
+    if new_rows:
+        df_expanded = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    else:
+        df_expanded = df
+    return df_expanded, aug_info
+
+# ── 0.4 波形 → mel 频谱图 PNG (与 audio_to_spectrogram 同流程) ──
+
+def _waveform_to_spectrogram_png(y, sr, clip_seconds, n_mels, save_path):
+    """把一维波形写成 mel 频谱图 PNG, 返回 save_path 或 None。"""
+    max_samples = int(sr * clip_seconds)
+    if len(y) > max_samples:
+        start = (len(y) - max_samples) // 2
+        y = y[start:start + max_samples]
+    else:
+        y = np.pad(y, (0, max_samples - len(y)), mode="constant")
+    try:
+        mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, n_fft=1024, hop_length=512)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        fig = plt.figure(figsize=(3, 3), dpi=100)
+        plt.imshow(mel_db, origin="lower", cmap="viridis")
+        plt.axis("off")
+        plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
+        fig.clf()
+        plt.close("all")
+        gc.collect()
+        return str(save_path)
+    except Exception:
+        return None
+
+# ── 0.5 FastAI 增强入口: augment_for_fastai ──
+
+def augment_for_fastai(df_train, resolve_audio_fn, sr=16000,
+                        clip_seconds=5.0, n_mels=128, img_dir=None,
+                        target_per_species=15, max_aug_per_species=50, seed=42):
+    """为 FastAI 一折的训练集生成增强样本 (频谱图 PNG)。
+    返回 (df_train_aug, report)。"""
+    img_dir = Path(img_dir) if img_dir else Path("./augmented_spectrograms")
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # 识别低资源物种
+    per_class = df_train["primary_label"].value_counts()
+    low_resource = per_class[per_class < target_per_species]
+    if len(low_resource) == 0:
+        print("[FastAI增强] 本折无低资源物种, 跳过。")
+        return df_train, {}
+
+    print(f"[FastAI增强] 低资源物种 {len(low_resource)} 种 (<{target_per_species} 条)")
+
+    # 用共享的 _expand_train_df 生成增强元数据
+    df_expanded, aug_info = _expand_train_df(
+        df_train.reset_index(drop=True),
+        low_resource.index.tolist(),
+        target_per_species=target_per_species,
+        max_aug_per_species=max_aug_per_species,
+        seed=seed,
+    )
+
+    # 按 original_filename 分组: 同一原始音频只读一次
+    by_original = {}
+    for info in aug_info:
+        by_original.setdefault(info["original_filename"], []).append(info)
+
+    new_rows = []
+    missing = 0
+    for orig_fn, infos in by_original.items():
+        orig_row = df_train[df_train["filename"] == orig_fn]
+        if len(orig_row) == 0:
+            missing += len(infos)
+            continue
+        path = resolve_audio_fn(orig_row.iloc[0])
+        if path is None:
+            missing += len(infos)
+            continue
+        try:
+            y, _ = librosa.load(path, sr=sr, mono=True)
+            if len(y) == 0:
+                missing += len(infos)
+                continue
+            y = librosa.util.normalize(y)
+        except Exception:
+            missing += len(infos)
+            continue
+
+        for info in infos:
+            v = int(info.get("variant_index", 0))
+            aug_y, _tag = _augment_waveform(y.astype(np.float32), sr=sr, seed=seed + v)
+            stem = Path(str(orig_fn)).stem
+            aug_png_name = f"{stem}_aug{v:02d}_{info['species']}.png"
+            aug_png_path = img_dir / aug_png_name
+            saved = _waveform_to_spectrogram_png(aug_y, sr, clip_seconds, n_mels, aug_png_path)
+            if saved is None:
+                missing += 1
+                continue
+            new_row = orig_row.iloc[0].to_dict()
+            new_row["filename"] = f"{stem}_aug{v:02d}.wav"
+            new_row["spectrogram_path"] = str(saved)
+            new_rows.append(new_row)
+
+    if missing:
+        print(f"  [WARN] {missing} 条增强样本因音频缺失被跳过")
+
+    if new_rows:
+        df_train_aug = pd.concat([df_train, pd.DataFrame(new_rows)], ignore_index=True)
+    else:
+        df_train_aug = df_train
+
+    print(f"[FastAI增强] df_train: {len(df_train)} -> {len(df_train_aug)} (+{len(new_rows)} 条增强频谱图)")
+
+    report = {}
+    for sp in low_resource.index:
+        before = int(low_resource[sp])
+        added = sum(1 for info in aug_info if info["species"] == sp)
+        report[sp] = {"before": before, "after": before + added, "added": added}
+
+    return df_train_aug, report
+
+# ============================================================
+# 1. 配置项与环境初始化
+# ============================================================
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+seed_everything(42)
+
+if torch.cuda.is_available():
+    print(f"✅ GPU 就绪: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+else:
+    print("⚠️ 未检测到 GPU")
+
+class Config:
+    SAMPLE_RATE = 16000
+    CLIP_SECONDS = 5.0
+    N_MELS = 128
+    IMAGE_SIZE = (224, 224)
+    N_FOLDS = 5
+    # ── V2 新增: 全量训练集 + 类别权重表 ──
+    TRAIN_FULL_CSV = "02_train_full_weighted.csv"
+    CLASS_WEIGHTS_CSV = "class_weights.csv"
+
+    @staticmethod
+    def _find_csv_dir():
+        """自动定位 CSV 数据目录 (Kaggle 优先, 本地回退)"""
+        kaggle_input = Path("/kaggle/input")
+        if not kaggle_input.exists():
+            return Path("../../data/data")
+        # 优先匹配新数据集 processeddata-129834
+        for _name in ["processeddata-129834", "fulldataset", "bird-dataset"]:
+            direct = kaggle_input / _name
+            if direct.exists():
+                return direct
+        # 递归搜索
+        for _name in ["processeddata-129834", "fulldataset"]:
+            for p in kaggle_input.glob(f"**/{_name}"):
+                if p.is_dir():
+                    return p
+        return Path("../../data/data")
+
+    CSV_DIR = _find_csv_dir.__func__()
+    TEST_CSV = "03_test_holdout.csv"
+
+    @staticmethod
+    def fold_csvs(fold: int):
+        return (f"cv_fold{fold}_train.csv", f"cv_fold{fold}_val.csv")
+
+    @classmethod
+    def fold_dir(cls, fold: int):
+        return cls.OUT_DIR / f"fold{fold}"
+
+    KAGGLE_INPUT = Path("/kaggle/input")
+
+    @staticmethod
+    def _default_out_dir():
+        if Path("/kaggle/working").exists():
+            return Path("/kaggle/working/fastai")
+        return Path("../outputs/fastai")
+
+    OUT_DIR = _default_out_dir.__func__()
+    IMG_DIR = OUT_DIR / "processed/fastai_spectrograms"
+    LABEL_MAP_PATH = OUT_DIR / "label_map.json"
+
+Config.IMG_DIR.mkdir(parents=True, exist_ok=True)
+Config.OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# 2. 音频特征工程 (RMS能量检测极速版 + OpenCV + 频率截断)
+# ============================================================
+_global_audio_index = {}
+if Config.KAGGLE_INPUT.exists():
+    for audio_path in Config.KAGGLE_INPUT.rglob("*.ogg"):
+        _global_audio_index[audio_path.name] = audio_path
+        relative_key = f"{audio_path.parent.name}/{audio_path.name}"
+        _global_audio_index[relative_key] = audio_path
+
+def resolve_audio_path(row):
+    fname = str(row['filename'])
+    if fname in _global_audio_index: return _global_audio_index[fname]
+    just_name = Path(fname).name
+    if just_name in _global_audio_index: return _global_audio_index[just_name]
+    return None
+
+def audio_to_spectrogram(row):
+    audio_path = resolve_audio_path(row)
+    if audio_path is None: return None
+        
+    safe_img_name = str(row['filename']).replace('/', '_') + ".png"
+    save_path = Config.IMG_DIR / safe_img_name
+    
+    if save_path.exists(): return str(save_path)
+        
+    try:
+        y, sr = librosa.load(audio_path, sr=Config.SAMPLE_RATE, mono=True)
+        frame_length = int(Config.SAMPLE_RATE * Config.CLIP_SECONDS)
+        
+        # 基于 librosa 底层的极速 RMS 能量检测
+        if len(y) > frame_length:
+            hop_length = 512
+            rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop_length)[0]
+            max_idx = np.argmax(rms)
+            
+            center_sample = max_idx * hop_length
+            start = max(0, min(center_sample - frame_length // 2, len(y) - frame_length))
+            y = y[start:start + frame_length]
+        else:
+            y = np.pad(y, (0, frame_length - len(y)), mode='constant')
+            
+        # 【优化 1】：Bandpass Filtering
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=Config.SAMPLE_RATE, n_mels=Config.N_MELS, n_fft=1024, hop_length=512,
+            fmin=500,   # 强制屏蔽 500Hz 以下的低频风声/水流声
+            fmax=8000   # 强制屏蔽 8000Hz 以上的高频白噪
+        )
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        
+        img = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+        img = (img * 255).astype(np.uint8)
+        img = np.flipud(img)
+        img_color = cv2.applyColorMap(img, cv2.COLORMAP_VIRIDIS)
+        img_resized = cv2.resize(img_color, Config.IMAGE_SIZE)
+        
+        cv2.imwrite(str(save_path), img_resized)
+        return str(save_path)
+    except Exception as e:
+        print(f"解析出错 {audio_path}: {e}")
+        return None
+
+def apply_multithread(df):
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        paths = list(tqdm(executor.map(audio_to_spectrogram, df.to_dict('records')), total=len(df)))
+    df['spectrogram_path'] = paths
+    return df
+
+# ============================================================
+# 3. 5 折交叉验证主管道 (V2: 平衡采样 + 类别加权 + 音频增强)
+# ============================================================
+def main_cv():
+    print(f"\n" + "="*60)
+    print(f"  FastAI V2 -- 5 Zhe Jiao Cha Yan Zheng | Zeng Qiang: [OK] Nei Lian")
+    print(f"  Shu Ju Mu Lu: {Config.CSV_DIR}")
+    print("="*60)
+
+    # -- 3.0 Du Qu Quan Liang Biao Qian Kong Jian (1,126 Lei) --
+    train_full_path = Config.CSV_DIR / Config.TRAIN_FULL_CSV
+    class_weights_path = Config.CSV_DIR / Config.CLASS_WEIGHTS_CSV
+    if not train_full_path.exists():
+        raise FileNotFoundError(f"[ERROR] Que Shao {Config.TRAIN_FULL_CSV}")
+    print(f"\n[INFO] Du Qu Quan Liang Biao Qian Kong Jian: {train_full_path}")
+    df_train_full = pd.read_csv(train_full_path)
+    all_labels = sorted(df_train_full["primary_label"].unique().tolist())
+    print(f"  Biao Qian Kong Jian: {len(all_labels)} Lei")
+
+    if class_weights_path.exists():
+        df_cw = pd.read_csv(class_weights_path)
+        weight_map = dict(zip(df_cw["primary_label"], df_cw["loss_class_weight"]))
+        class_weight_tensor = torch.tensor([weight_map.get(label, 1.0) for label in all_labels], dtype=torch.float)
+    else:
+        class_weight_tensor = None
+
+    test_csv = Config.CSV_DIR / Config.TEST_CSV
+    print(f"\n[INFO] Du Qu Ce Shi Ji: {test_csv}")
+    df_test = pd.read_csv(test_csv)
+    print(f"  Ce Shi Ji: {len(df_test)} Tiao")
+    df_test = apply_multithread(df_test)
+    df_test = df_test.dropna(subset=["spectrogram_path"]).reset_index(drop=True)
+
+    birds_db = DataBlock(
+        blocks=(ImageBlock, CategoryBlock(vocab=all_labels)),
+        get_x=ColReader("spectrogram_path"),
+        get_y=ColReader("primary_label"),
+        splitter=ColSplitter("is_valid"),
+        item_tfms=[],
+        batch_tfms=[Normalize.from_stats(*imagenet_stats), RandomErasing(p=0.4, sl=0.05, sh=0.15)])
+    clean_accs = []
+
+    for fold in range(1, Config.N_FOLDS + 1):
+        print(f"\n[Fold {fold}/{Config.N_FOLDS}] Kai Shi")
+        fold_out = Config.fold_dir(fold)
+        fold_out.mkdir(parents=True, exist_ok=True)
+        train_name, val_name = Config.fold_csvs(fold)
+        train_path = Config.CSV_DIR / train_name
+        val_path = Config.CSV_DIR / val_name
+        if not train_path.exists():
+            raise FileNotFoundError(f"[ERROR] Que Shao {train_name}")
+
+        df_train = pd.read_csv(train_path).assign(is_valid=False)
+        df_val = pd.read_csv(val_path).assign(is_valid=True)
+        print(f"  Xun Lian: {len(df_train)}, Yan Zheng: {len(df_val)}")
+
+        print("  [INFO] Sheng Cheng Xun Lian Ji Pin Pu Tu...")
+        df_train = apply_multithread(df_train)
+        df_train = df_train.dropna(subset=["spectrogram_path"]).reset_index(drop=True)
+
+        aug_seed = 42 + fold
+        df_train, aug_report = augment_for_fastai(df_train, resolve_audio_path, sr=Config.SAMPLE_RATE, clip_seconds=Config.CLIP_SECONDS, n_mels=Config.N_MELS, img_dir=Config.IMG_DIR, target_per_species=15, max_aug_per_species=50, seed=aug_seed)
+        total_added = sum(r["added"] for r in aug_report.values())
+        if total_added > 0:
+            print(f"  [OK] Zeng Qiang: {len(aug_report)} Zhong, Xin Zeng {total_added} Tiao")
+
+        print("  [INFO] Sheng Cheng Yan Zheng Ji Pin Pu Tu...")
+        df_val = apply_multithread(df_val)
+        df_val = df_val.dropna(subset=["spectrogram_path"]).reset_index(drop=True)
+        df_fold = pd.concat([df_train, df_val], ignore_index=True)
+
+        dls = birds_db.dataloaders(df_fold, bs=32, num_workers=4)
+        train_mask = ~df_fold["is_valid"].values
+        tw = df_fold.loc[train_mask, "sampler_weight"].values.astype(np.float64)
+        tw = np.maximum(np.nan_to_num(tw, nan=0.0, posinf=0.0, neginf=0.0), 1e-8)
+        train_weights = torch.tensor(tw, dtype=torch.float)
+        train_sampler = WeightedRandomSampler(train_weights, len(train_weights), replacement=True)
+        old_dl = dls.train
+        new_train_dl = TfmdDL(old_dl.dataset, bs=old_dl.bs, sampler=train_sampler, num_workers=old_dl.num_workers, after_item=old_dl.after_item, after_batch=old_dl.after_batch, device=old_dl.device)
+        dls.train = new_train_dl
+        print("  [OK] WeightedRandomSampler Yi Qi Yong")
+
+        classes = list(dls.vocab)
+        if fold == 1:
+            with open(Config.LABEL_MAP_PATH, "w") as f:
+                json.dump({name: idx for idx, name in enumerate(classes)}, f, indent=4)
+
+        if class_weight_tensor is not None:
+            _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            loss_func = FocalLossFlat(gamma=2.0, weight=class_weight_tensor.to(_dev))
+        else:
+            loss_func = FocalLossFlat(gamma=2.0)
+
+        learn = vision_learner(dls, "convnext_small", metrics=[accuracy, F1Score(average="macro")], loss_func=loss_func, cbs=[MixUp(alpha=0.4)], path=fold_out).to_fp16()
+        learn.fine_tune(epochs=12, base_lr=2e-3, freeze_epochs=3)
+        learn.export(fold_out / "fastai_bird_model.pkl")
+
+        test_dl = learn.dls.test_dl(df_test, with_labels=True)
+        preds, targets = learn.get_preds(dl=test_dl)
+        y_prob, y_pred, y_true = preds.numpy(), preds.argmax(dim=1).numpy(), targets.numpy()
+        test_acc = accuracy_score(y_true, y_pred)
+        clean_accs.append(float(test_acc))
+        print(f"  [Fold {fold}] Ce Shi Ji Clean Acc: {test_acc:.4f}")
+
+        np.savez(fold_out / "test_predictions.npz", y_true=y_true, y_pred=y_pred, y_prob=y_prob, classes=np.array(classes), test_filenames=df_test["filename"].values)
+
+        del learn, dls, new_train_dl, old_dl
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("\n" + "="*60 + "\n  Jiao Cha Yan Zheng Jie Shu\n" + "="*60)
+    clean_arr = np.array(clean_accs)
+    pd.DataFrame({"fold": range(1, Config.N_FOLDS + 1), "clean_acc": clean_arr}).to_csv(Config.OUT_DIR / "cv_per_fold.csv", index=False)
+    print(f"  [Hui Zong] FastAI V2 Clean Acc: {clean_arr.mean():.4f} +/- {clean_arr.std(ddof=1):.4f}")
+
+if __name__ == "__main__":
+    main_cv()
+

@@ -125,16 +125,16 @@ Because augmentation happens after the fold split, augmented siblings cannot ent
 
 ## 6. Formal output files
 
-The formal outputs are in `processed data-129834/`.
+The formal outputs are in `processeddata-129834/`.
 
 | File | Contents |
 | --- | --- |
-| `01_bird_only_full.csv` | 144,250 cleaned bird records |
 | `02_train_full_weighted.csv` | 129,834 training rows with `class_count_train`, `sampler_weight`, `loss_class_weight`, and `cv_fold` |
 | `03_test_holdout.csv` | 14,416 fixed holdout rows |
 | `class_weights.csv` | One row per species with its count and both weights |
 | `cv_fold{1-5}_train.csv` / `cv_fold{1-5}_val.csv` | Five CV splits |
-| `summary.csv` | Split row/species totals |
+
+> `01_bird_only_full.csv` (144,250 cleaned bird records) and `summary.csv` (split row/species totals) are intermediate process files; they have been moved to the backup directory `过程文件仅作备份，无需使用/` and are not needed for training or evaluation.
 
 Validation folds contain 25,949-25,981 records. Checks confirmed no `filename` overlap between train/test, nor between training and validation within a fold.
 
@@ -143,7 +143,7 @@ Validation folds contain 25,949-25,981 records. Checks confirmed no `filename` o
 Regenerate the split with:
 
 ```bash
-cd E:\MLwork\MLwork\data\augmenteddata
+cd E:\MLwork\MLwork\bird-vocalization-classifier\full-kaggle-data
 python prepare_full_training_data.py
 ```
 

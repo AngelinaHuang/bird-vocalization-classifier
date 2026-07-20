@@ -1,0 +1,586 @@
+================================================================================
+  YAMNet 冻结版 + LightGBM 嵌入导出 — 交接文档
+  作者: Wenjuan Huang
+  日期: 2026-07-18 / 更新: 2026-07-19
+  交付物: yamnet_frozen_lightgbm_export.ipynb
+================================================================================
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 一、项目背景与问题诊断
+╚══════════════════════════════════════════════════════════════════════════════
+
+1.1 原始 e2e 微调版的问题
+
+  文件: YAMNet/src/e2e/yamnet_e2e_all_in_one.ipynb (未改动, 保留)
+  数据: full-kaggle-data/processeddata-129834/ (129,834 训练样本, 1,126 类)
+  现象: Kaggle 上运行 ~2.3 小时后报 "Kernel died while waiting for execute reply"
+
+  根本原因: 内存爆炸 (OOM)
+  - 单条波形 = 16000Hz * 5.0s = 80,000 采样点 = 320 KB (float32)
+  - 129,834 训练样本 * 320 KB = ~41.5 GB
+  - Kaggle kernel RAM 上限 16 GB, 远超
+  - 代码中 build_waveform_cache() 同时持有:
+    (a) fn2wf 字典 (全部去重波形)
+    (b) X_train = np.stack(...) (另一份完整拷贝)
+    (c) np.savez() 写盘时再拷贝一次
+  - 在 stack 或 savez 阶段 RAM 触顶被 kill
+
+  其他问题:
+  - WAVEFORM_CACHE 指向 /kaggle/working (输出盘 19 GB), 写不下 46 GB 缓存
+  - model.evaluate(X_test, ...) 一次性把 14K*80000 数组喂进 GPU, 显存也爆
+  - tf.function 末尾 batch 大小不一, 反复 XLA 编译
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 二、解决方案: 冻结 YAMNet + 流式嵌入
+╚══════════════════════════════════════════════════════════════════════════════
+
+2.1 核心思路
+
+  - 冻结 YAMNet (trainable=False): 只前向, 不反传, 一次性算完全部嵌入
+  - 流式 tf.data + tf.py_function: 包装 librosa.load, 内存恒定 ~MB 级
+  - 嵌入缓存: 算一次存 .npz (~1.7 GB for 3072-dim), 跨折复用
+  - 5 折 Dense 头训练: 在嵌入上训练轻量分类头 (Dense 256 -> 1126)
+
+2.2 为什么冻结而非微调
+
+  - 时间: 冻结全流程 1-2 小时; e2e 微调 5 折 * 40 epoch = 60+ 小时
+    (e2e 每 epoch 都要全量前向+反向 130K 样本, 冻结只跑 1 次前向)
+  - 内存: 冻结可开 batch=64 (无梯度); e2e 只能 8-16 (梯度占显存)
+  - 方法论: 冻结 YAMNet 嵌入是 deterministic 特征, 给 LightGBM stacking 无泄漏
+            (e2e 微调的 train embeddings 会被 LightGBM 看到 "已训练过的样本" → 过拟合)
+  - 精度: YAMNet 在 AudioSet 预训练 (527 类含鸟鸣), 冻结嵌入本身就有区分力
+          LightGBM 学 3072 维 → 1126 类, 比简单 Dense 头更强
+
+2.3 嵌入聚合策略 (契约推荐)
+
+  YAMNet 输出帧级嵌入 (B, T, 1024), 聚合为单条音频的 D 维向量:
+  - "mean"        → 1024 维 (仅均值)
+  - "mean_max"    → 2048 维 (均值 + 最大值)
+  - "mean_max_std"→ 3072 维 (均值 + 最大值 + 标准差) ← 当前使用, 契约推荐
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 三、交付物: yamnet_frozen_lightgbm_export.ipynb
+╚══════════════════════════════════════════════════════════════════════════════
+
+3.1 文件位置
+
+  E:\MLwork\MLwork\bird-vocalization-classifier\YAMNet\src\yamnet_frozen_lightgbm_export.ipynb
+
+  注意: 原始 e2e 微调版 e2e/yamnet_e2e_all_in_one.ipynb 未改动, 保留
+
+3.2 Notebook 结构 (15 个 Cell)
+
+  Cell 0  (md)   : 概述 + 设计思路 + 数据集说明
+  Cell 1  (md)   : Cell 1/7: 依赖与配置
+  Cell 2  (code) : 依赖导入 + Cfg 配置类 (POOL_MODE, EMBED_DIM=3072, 路径, 超参)
+  Cell 3  (md)   : Cell 2/7: Kaggle 挂载扫描 + CSV 加载 + 标签映射
+  Cell 4  (code) : scan_kaggle_inputs, resolve_audio_path, build_label_map
+  Cell 5  (md)   : Cell 3/7: 流式音频解码 + 冻结 YAMNet 嵌入提取
+  Cell 6  (code) : _load_wf_py (librosa, res_type=kaiser_fast), _pool_frames (mean+max+std),
+                   build_embedding_extractor (冻结 YAMNet, 批量探测 + map_fn 回退),
+                   compute_embeddings_streaming
+  Cell 7  (md)   : Cell 4/7: 嵌入缓存 + LightGBM 导出 + 5 折分类头训练
+  Cell 8  (code) : build_embedding_cache, export_contract_embeddings, slice_embeddings,
+                   export_for_lightgbm, build_classifier, main_cv_head
+  Cell 9  (md)   : Cell 5/7: 噪声鲁棒性评估 (流式)
+  Cell 10 (code) : add_gaussian_noise, _load_noisy_wf_py, build_noise_embeddings_streaming,
+                   main_noise_eval
+  Cell 11 (md)   : Cell 6/7: 推理速度测试
+  Cell 12 (code) : measure_inference (head-only + full pipeline)
+  Cell 13 (md)   : 一键运行
+  Cell 14 (code) : main() — 顺序执行全流程
+
+3.3 参考的已有代码
+
+  - yamnet_bird_pipeline.py : scan/resolve/load_waveform/build_classifier 逻辑
+  - noise_robustness_eval.py: 噪声叠加强度 (5dB/0dB/-5dB) 逻辑
+  - unified_evaluation.py   : 评估指标定义 (notebook 内未直接调用, 可后接)
+  - e2e/yamnet_e2e_all_in_one.ipynb : Cfg 类结构 + fold CSV 命名
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 四、LightGBM 队友契约 (已全部满足)
+╚══════════════════════════════════════════════════════════════════════════════
+
+4.1 契约要求 vs 实现
+
+  ┌─────────────────────────────────┬──────────────────────────┬──────┐
+  │ 契约要求                        │ 实现位置                 │ 状态 │
+  ├─────────────────────────────────┼──────────────────────────┼──────┤
+  │ yamnet_embeddings/embeddings.npz │ Cell 8 export_contract_  │  OK  │
+  │                                 │ embeddings()             │      │
+  │ key: filenames (N,) str         │ np.array(fn_list)        │  OK  │
+  │ key: emb (N,D) float32          │ emb=emb_arr              │  OK  │
+  │ D=1024/2048/3072 (推荐           │ POOL_MODE="mean_max_std"│  OK  │
+  │   mean_max_std)                 │ EMBED_DIM=3072          │      │
+  │ embeddings_5db.npz              │ Cell 10, 独立文件       │  OK  │
+  │ embeddings_0db.npz              │ Cell 10, 独立文件       │  OK  │
+  │ embeddings_m5db.npz             │ Cell 10, 独立文件       │  OK  │
+  └─────────────────────────────────┴──────────────────────────┴──────┘
+
+4.2 输出文件清单
+
+  /kaggle/working/yamnet_embeddings/  (给 LightGBM 队友的契约目录)
+  ├── embeddings.npz            全量 ~144K 条 (filenames + emb, 3072维)
+  ├── embeddings_clean.npz      测试集 14K 条 clean (filenames + emb)
+  ├── embeddings_5db.npz        测试集 14K 条 5dB 叠噪 (filenames + emb)
+  ├── embeddings_0db.npz        测试集 14K 条 0dB 叠噪 (filenames + emb)
+  ├── embeddings_m5db.npz       测试集 14K 条 -5dB 叠噪 (filenames + emb)
+  ├── label_map.json            label2idx + idx2label + classes
+  ├── fold{1-5}_train.npz       每折训练切片 (embeddings + labels + 类权重)
+  └── fold{1-5}_val.npz         每折验证切片 (embeddings + labels)
+
+  /kaggle/working/yamnet/       (YAMNet 自身输出目录)
+  ├── embeddings_all.npz        内部嵌入缓存 (filenames + labels_str + emb)
+  ├── noise_embeddings.npz      内部噪声缓存 (X_clean/X_5db/X_0db/X_m5db)
+  ├── label_map.json            标签映射 (与 EMB_DIR 同步)
+  ├── cv_per_fold.csv           5 折 clean accuracy
+  ├── cv_noise_per_fold.csv    5 折噪声 accuracy
+  ├── cv_summary.csv            汇总 mean+/-std
+  ├── inference_metrics.csv     推理延迟
+  └── fold{1-5}/
+      ├── head_model.keras       Dense 头权重
+      ├── test_predictions.npz   测试预测
+      └── noise_results.npz      噪声评估结果
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 五、数据集说明
+╚══════════════════════════════════════════════════════════════════════════════
+
+5.1 Kaggle Input 挂载
+
+  (1) processeddata-129834/ (上传为 Kaggle input dataset)
+      ├── 02_train_full_weighted.csv   129,834 行 (含 sampler_weight, loss_class_weight, cv_fold)
+      ├── 03_test_holdout.csv          14,416 行 (无权重列)
+      ├── cv_fold{1-5}_train.csv       每折 ~103,863 行
+      ├── cv_fold{1-5}_val.csv          每折 ~25,971 行
+      └── class_weights.csv           每类权重 (1/sqrt(count), clip[0.25, 4.00])
+
+  (2) BirdCLEF 2021-2026 年度音频数据集 (各自挂载为 Kaggle input)
+      音频目录名: train_audio / train_short_audio
+
+5.2 CSV 关键列
+
+  filename      : 如 "abethr1/XC128013.ogg" (含 primary_label 子目录 + 文件名)
+  primary_label: 如 "abethr1" (鸟类代码)
+  source_year  : 如 2023 或 "2025,2026" (多年份, 字符串)
+  sampler_weight   : float, 每样本采样权重
+  loss_class_weight: float, 每样本类权重 (来自 class_weights.csv)
+  cv_fold      : 1-5, 交叉验证折号
+
+5.3 音频路径解析
+
+  按 source_year 优先匹配年度音频根, 候选顺序:
+    1) {root}/{filename}                 命中 2022+ 及平铺命名
+    2) {root}/{primary_label}/{basename} 命中 2021 (按 label 分目录)
+    3) {root}/{basename}                 平铺兜底
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 六、关键配置 (Cfg 类, Cell 2)
+╚══════════════════════════════════════════════════════════════════════════════
+
+  参数               值             说明
+  ─────────────────  ────────────  ──────────────────────────
+  SR                 16000         YAMNet 要求的采样率
+  CLIP_SECONDS       5.0           统一音频长度 (秒)
+  CLIP_SAMPLES       80000         16000 * 5.0
+  POOL_MODE          "mean_max_std" 聚合模式 (可选 "mean"/"mean_max"/"mean_max_std")
+  EMBED_DIM          3072          1024 * 3 (mean+max+std)
+  EMB_BATCH_SIZE     128            嵌入提取 batch (冻结前向, 已优化)
+  HEAD_BATCH_SIZE    256           Dense 头训练 batch
+  HEAD_EPOCHS        50             Dense 头训练最大 epoch (有 EarlyStopping patience=8)
+  HEAD_LR            1e-3           Dense 头学习率
+  DROPOUT            0.3           Dense 头 dropout
+  SEED               42            随机种子
+  N_FOLDS            5             交叉验证折数
+
+  如需切换嵌入维度:
+    POOL_MODE = "mean"        -> 1024 维 (和旧版一致)
+    POOL_MODE = "mean_max"    -> 2048 维
+    POOL_MODE = "mean_max_std"-> 3072 维 (契约推荐, 当前使用)
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 七、时间估算
+╚══════════════════════════════════════════════════════════════════════════════
+
+  阶段                        估算耗时          说明
+  ─────────────────────────  ────────────────  ──────────────────
+  1. 嵌入提取 (一次性)        20-60 min        144K 文件, librosa 解码 + GPU 前向
+                                               (批量调用则 20-30 min; 二次运行 < 1 min)
+  2. 5 折 Dense 头训练         5-15 min         3072 维 -> Dense(256) -> 1126 类
+                                               每折 50 epoch (有 EarlyStopping)
+  3. 噪声嵌入提取              10-15 min         14K 测试集 * 3 档 SNR
+  4. 噪声评估                  < 1 min           各折模型 predict
+  5. 推理速度测试              < 1 min
+  ─────────────────────────  ────────────────
+  合计 (首次运行)              ~1-1.5 小时       单个 Kaggle 9h session 足够
+  合计 (二次运行, 有缓存)      ~10-15 min
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 八、如何使用
+╚══════════════════════════════════════════════════════════════════════════════
+
+  8.1 Kaggle 运行步骤
+
+    1. 上传 yamnet_frozen_lightgbm_export.ipynb 到 Kaggle Notebook
+    2. 右侧 Add Input:
+       (a) 挂载 processeddata-129834 数据集 (CSV 元数据)
+       (b) 挂载 BirdCLEF 2021-2026 年度音频数据集 (ogg 音频)
+    3. Settings -> Accelerator: GPU (P100 或 T4)
+    4. Run All
+    5. 运行完成后, Output 中的 yamnet_embeddings/ 即可给 LightGBM 队友
+
+  8.2 二次运行 (缓存已存在)
+
+    - 嵌入缓存 embeddings_all.npz 存在时, 跳过 YAMNet 前向, 秒读
+    - 噪声缓存 noise_embeddings.npz 存在时, 跳过叠噪重算
+    - 适合调参 Dense 头超参时快速迭代
+
+  8.3 切换嵌入维度
+
+    Cell 2 中改 Cfg.POOL_MODE:
+      "mean"        -> 1024 维 (最快, 契约允许)
+      "mean_max"    -> 2048 维
+      "mean_max_std"-> 3072 维 (契约推荐, 当前默认)
+    注意: 改维度后旧缓存会因 key 不匹配而失效, 需删 cache 重算
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 九、对 YAMNet 训练的影响 (Q&A)
+╚══════════════════════════════════════════════════════════════════════════════
+
+  Q: 契约修改 (mean_max_std, 3072维, 导出) 会影响 YAMNet 训练吗?
+  A: 不会。原因:
+
+  1. YAMNet 是冻结的 (trainable=False), 整个流程中 YAMNet 参数一个都不动
+  2. _pool_frames() 是纯统计运算 (mean/max/std), 无可训练参数
+  3. export_contract_embeddings() 是纯 I/O, 训练后写盘, 不影响训练
+  4. 噪声文件拆分只改保存方式, 评估逻辑不变
+  5. 唯一变化: Dense 头输入 1024 -> 3072
+     参数量: 262K -> 787K (仍极轻量, < 1M)
+     准确率: 持平或略高 (3072 维信息更丰富)
+
+  数据流:
+  波形 -> [YAMNet 冻结] -> 帧嵌入(T,1024) -> [mean+max+std 统计, 无参数] -> 3072维
+       -> [Dense 头, 可训练] -> 预测
+         ↑ 不动                ↑ 无参数                        ← 唯一训练部分
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十、与 e2e 微调版的对比
+╚══════════════════════════════════════════════════════════════════════════════
+
+  维度            冻结版 (本 notebook)              e2e 微调版 (e2e/ 目录)
+  ─────────────  ──────────────────────────────  ──────────────────────────────
+  YAMNet 状态    trainable=False (冻结)           trainable=True (解冻顶层 6 层)
+  内存            ~MB 级 (流式 tf.data)            ~41 GB (预加载全部波形) → OOM
+  嵌入维度        3072 (mean+max+std)             1024 (mean only)
+  训练对象        仅 Dense 头 (~787K 参数)          YAMNet 顶层 + Dense 头
+  前向次数        1 次 (全量)                      200 次 (40 epoch * 5 fold)
+  总耗时          ~1-2 小时                        ~60+ 小时 (超 Kaggle 9h 限)
+  LightGBM 契约   满足 (frozen, 无泄漏)            train embeddings 有泄漏风险
+  Kaggle 可跑     可以 (单 session)               不可以 (OOM + 超时)
+
+  结论: 冻结版是 Kaggle 环境下的可行方案, e2e 微调版需改流式才能跑
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十一、后续可优化方向 (TODO)
+╚══════════════════════════════════════════════════════════════════════════════
+
+  (已完成 2026-07-19: YAMNet 批量调用探测 + res_type=kaiser_fast + batch=128 + iterrows→to_dict, 全流程压缩到 1-1.5h)
+
+  1. Stage 2 短暂 e2e 微调 (可选):
+     用冻结嵌入训练 Dense 头后, 以冻结模型为起点, 对最难的 5-10K 样本
+     (LightGBM 错分的) 跑 2-3 epoch 微调, ~30-60 min, 可提升 1-3 个百分点
+
+  2. tensorflow_io 加速解码:
+     当前用 librosa.load (~100ms/file), 可换 tfio.audio.decode_ogg (~10ms/file)
+     需处理 BirdCLEF ogg 的混合采样率 (48k/44.1k)
+
+  3. CLIP_SECONDS 优化:
+     YAMNet 内部用 0.96s 窗口, 5s 可能过长
+     改 3s 可降 40% 内存和 40% 解码时间, 精度影响很小
+
+  4. e2e 微调版改造:
+     如确需微调, 将 e2e notebook 改成流式 tf.data (参考本 notebook 的
+     load_waveform_tf + compute_embeddings_streaming), 配合断点续训
+     (FOLD_TO_RUN 环境变量), 分 5 个 Kaggle session 跑完
+
+  5. 数据增强:
+     冻结版未做数据增强 (低资源物种扩充), 如需可在 tf.data pipeline 中
+     加入 time_stretch / pitch_shift / noise injection (在 _load_wf_py 后)
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十二、Kaggle Output 输出说明 (重要)
+╚══════════════════════════════════════════════════════════════════════════════
+
+12.1 输出机制
+
+  Kaggle notebook 运行结束后, /kaggle/working/ 下的所有文件都会被保存为
+  该 notebook 的 Output。队友在自己 notebook 里 Add Input 选你的 notebook,
+  即可挂载读取。
+
+12.2 当前输出目录和大小估算
+
+  /kaggle/working/                          <- 全部会成为 output
+  ├── yamnet_embeddings/                    <- 给队友的契约目录
+  │   ├── embeddings.npz          ~1.77 GB   全量 144K * 3072 维 (契约必需)
+  │   ├── embeddings_clean.npz     ~172 MB    测试集 14K clean (契约必需)
+  │   ├── embeddings_5db.npz       ~172 MB    测试集 14K 5dB (契约必需)
+  │   ├── embeddings_0db.npz       ~172 MB    测试集 14K 0dB (契约必需)
+  │   ├── embeddings_m5db.npz      ~172 MB    测试集 14K -5dB (契约必需)
+  │   ├── fold{1-5}_train.npz      ~6.4 GB    每折训练切片 (冗余, 可删)
+  │   ├── fold{1-5}_val.npz        ~1.6 GB    每折验证切片 (冗余, 可删)
+  │   ├── test.npz                  ~172 MB    测试切片 (冗余, 可删)
+  │   └── label_map.json            ~50 KB     标签映射 (必需)
+  │
+  └── yamnet/                               <- YAMNet 自身输出
+      ├── embeddings_all.npz       ~1.77 GB   内部缓存 (冗余, 可移到 temp)
+      ├── noise_embeddings.npz     ~688 MB    内部噪声缓存 (冗余, 可移到 temp)
+      ├── fold{1-5}/*.keras        ~15 MB     Dense 头模型
+      └── *.csv                     ~1 MB      汇总指标
+
+  总计 ~13 GB, Kaggle output 上限 19 GB, 能放下但偏紧。
+
+12.3 冗余分析
+
+  - fold{N}_train/val.npz (~8 GB):
+    是 embeddings.npz 的切片副本, 队友可自行按 filenames 切片
+  - embeddings_all.npz (~1.77 GB):
+    和 embeddings.npz 内容重复 (多了 labels_str 字段)
+  - noise_embeddings.npz (~688 MB):
+    和 embeddings_5db/0db/m5db.npz 内容重复 (内部用的合并版)
+  真正的契约文件只占 ~2.3 GB。
+
+12.4 优化方案 (如需降低 output 体积)
+
+  方案 A: 内部缓存移到 /kaggle/temp/ (不进 output, 省 ~2.5 GB)
+    Cell 2 Cfg 类里改:
+      OUT_DIR = "/kaggle/temp/yamnet"              # 内部缓存, 不进 output
+      EMB_DIR = "/kaggle/working/yamnet_embeddings" # 契约输出, 进 output
+    /kaggle/temp/ 运行期间可读写, 但不会被保存为 output。
+
+  方案 B: 删掉冗余 per-fold 切片 (省 ~8 GB)
+    Cell 8 export_for_lightgbm() 里注释掉 per-fold 保存:
+      # np.savez(os.path.join(cfg.EMB_DIR, f"fold{fold}_train.npz"), ...)
+      # np.savez(os.path.join(cfg.EMB_DIR, f"fold{fold}_val.npz"), ...)
+    队友直接从 embeddings.npz 按 filenames 自行切片。
+
+  两个方案都做: output 从 ~13 GB 降到 ~2.3 GB, 非常安全。
+
+12.5 队友如何获取数据
+
+  1. 你的 notebook 跑完 -> Output 生成
+  2. 队友新建 notebook -> 右侧 Add Input -> Your Work -> 选你的 notebook
+  3. 数据挂载到 /kaggle/input/<你的notebook名>/yamnet_embeddings/
+  4. 读取代码:
+     import numpy as np
+     d = np.load("/kaggle/input/<notebook>/yamnet_embeddings/embeddings.npz")
+     filenames = d["filenames"]   # (N,) str, 如 "abethr1/XC128013.ogg"
+     emb = d["emb"]               # (N, 3072) float32
+
+     # 按噪声档读取:
+     d5 = np.load("/kaggle/input/<notebook>/yamnet_embeddings/embeddings_5db.npz")
+     emb_5db = d5["emb"]          # (N_test, 3072) float32
+
+     # 标签映射:
+     import json
+     with open("/kaggle/input/<notebook>/yamnet_embeddings/label_map.json") as f:
+         m = json.load(f)
+         label2idx = m["label2idx"]  # {"abethr1": 0, ...}
+         classes = m["classes"]      # ["abethr1", "abhori1", ...]
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十三、Bug 修复记录 (2026-07-18 Kaggle 首跑反馈)
+╚══════════════════════════════════════════════════════════════════════════════
+
+  首次提交 Kaggle 运行, ~427s 后在 Cell 10 报 SyntaxError。排查后修复 3 个
+  bug, 全部已验证通过 (AST 语法检查 + pyflakes + 逻辑审查)。
+
+13.1 Bug 列表
+
+  ┌────┬──────┬────────┬────────┬──────────────────────────────────────────────┐
+  │ # │ Cell │ 行号   │ 严重度 │ 问题                                        │
+  ├────┼──────┼────────┼────────┼──────────────────────────────────────────────┤
+  │ 1  │  10  │ 153    │ 致命   │ 三元表达式缺 else → SyntaxError,           │
+  │    │      │        │        │ 整个 Cell 10 无法解析                       │
+  │ 2  │  8   │ 175-180│ 高危   │ sw_tr/sw_va 先访问列再检查列是否存在,       │
+  │    │      │        │        │ 若 fold CSV 无该列则 KeyError 崩溃          │
+  │ 3  │ 6,10 │ 68, 60 │ 边界   │ 空文件列表时 np.concatenate([]) 报          │
+  │    │      │        │        │ ValueError + 除零, 加 n==0 守卫              │
+  └────┴──────┴────────┴────────┴──────────────────────────────────────────────┘
+
+13.2 Bug 1: 三元表达式缺 else (Cell 10, line 153)
+
+  现象: Kaggle 日志报 SyntaxError: expected 'else' after 'if' expression
+  原因:
+    # ❌ 缺 else 分支
+    existing = pd.read_csv(summary_path) if summary_path.exists()
+
+  修复:
+    # ✅ 加 else None
+    existing = pd.read_csv(summary_path) if summary_path.exists() else None
+    if not existing:
+        existing = pd.DataFrame(columns=["metric", "mean", "std"])
+
+  影响: main_noise_eval() 中 cv_summary.csv 的续写逻辑
+
+13.3 Bug 2: 列访问顺序错误 (Cell 8, lines 175-180)
+
+  现象: 若 cv_fold{N}_train.csv 没有 loss_class_weight 列, 第一行就 KeyError
+  原因:
+    # ❌ 先访问, 后检查 — 检查永远到不了
+    sw_tr = df_tr["loss_class_weight"].values.astype(np.float32)
+    if "loss_class_weight" not in df_tr.columns:
+        sw_tr = None
+
+  修复:
+    # ✅ 先检查, 再访问
+    if "loss_class_weight" in df_tr.columns:
+        sw_tr = df_tr["loss_class_weight"].values.astype(np.float32)
+    else:
+        sw_tr = None
+
+  影响: main_cv_head() 中 Dense 头训练的 sample_weight 传入
+  注意: sw_va (验证集) 同理修复
+
+13.4 Bug 3: 空列表边界 (Cell 6 line 68, Cell 10 line 60)
+
+  现象: 若音频文件全部解析失败, filepaths 为空, np.concatenate([]) 报错
+  修复: 在 compute_embeddings_streaming 和 build_noise_embeddings_streaming 中加守卫:
+    if n == 0:
+        return np.zeros((0, cfg.EMBED_DIM), dtype=np.float32)  # Cell 6
+        return {}                                                 # Cell 10
+
+  影响: 边界保护, 正常运行不触发 (main() 已有 year2root 空检查)
+
+13.5 验证方法
+
+  - AST 语法检查: 全部 7 个 code cell ast.parse() 通过
+  - pyflakes: 无未定义变量、无未使用导入 (除 Counter/plt)
+  - 函数调用链: main() 调用的 10 个函数全部有定义
+  - 契约 key 验证: embeddings.npz → filenames + emb; 噪声文件同理
+  - 列访问守卫: 所有 weight 列访问前均有 if-in 检查
+  - 模型路径一致性: head_model.keras 存/读路径一致 (fold{N}/head_model.keras)
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十四、2026-07-19 修复 + 性能优化
+╚══════════════════════════════════════════════════════════════════════════════
+
+  14.1 Bug 4: _per_sample 误取 logits (521维) 导致嵌入维度错误 (致命)
+
+  现象:
+    Kaggle 日志: embeddings_all.npz shape=(144250, 1563), Dense 头期望 3072,
+    训练时报 "expected axis -1 ... to have value 3072, but received ... (None, 1563)"
+
+  根因:
+    YAMNet 有两个输出:
+      - frame_embeddings (T, 1024) ← 需要的嵌入
+      - logits (T, 521)              ← AudioSet 分类 logits
+
+    原代码 _per_sample():
+      out = yamnet_layer(w)
+      if isinstance(out, (list, tuple)):
+          return out[0]     # 在某些 Kaggle TF 版本中, out[0] 是 logits(521)
+      return out
+
+    _pool_frames 对 521 维做 mean+max+std → 521×3 = 1563 维, 导致 Dense 头崩溃。
+
+  修复:
+    新增 _select_frame_emb(out) 函数, 按 last_dim==1024 契约从任意 YAMNet 输出
+    (dict / list / tuple / single tensor) 中健壮选取 frame_embeddings。dict 中优先
+    按 key 名 "frame_embeddings"/"embedding"/"embeddings" 查找, 找不到则扫描全部
+    value 选出 last_dim==1024 的 tensor, 再不济显式抛错 (带 keys+shapes 诊断)。
+    对 list/tuple 同样: 先按 dim 筛选, 找不到才回退取第一个。
+
+  影响:
+    - Cell 6: build_embedding_extractor → _select_frame_emb 替代原 _per_sample 选择逻辑
+    - Cell 8: build_embedding_cache → 新增 cached_dim ≠ EMBED_DIM 自动删旧缓存
+    - Cell 8: 新增 X.shape[1] == EMBED_DIM 断言, 嵌入维度不对立即报错而非跑到训练才崩
+
+  14.2 优化 1: YAMNet 批量调用探测 + tf.map_fn 回退 (提速 3-10×)
+
+  旧代码:
+    tf.vectorized_map(_per_sample, x) — 对 KerasLayer 调用退化为串行展开,
+    batch=64 实际调 YAMNet 64 次, GPU 利用率极低, 144K 文件耗时 ~2.5h。
+
+  新代码:
+    运行时探测: yamnet_layer(tf.zeros((2, 80000))) 是否接受批量输入?
+    - 若支持 → 直接 yamnet_layer(x), 一次前向处理整 batch → 预期 5-10× 加速
+    - 若不支持 → tf.map_fn(_per_sample, x, parallel_iterations=8) → 预期 2-3× 加速
+
+  日志输出:
+    [YAMNet] 批量调用: 支持 (单次前向处理整 batch, 最优路径)    ← 看到 "支持" 表示最快路径
+    [YAMNet] 批量调用: 不支持, 回退到 tf.map_fn(parallel_iterations=8) ← 仍比旧版快
+
+  14.3 优化 2: EMB_BATCH_SIZE 64 → 128
+
+  旧值 64, 增至 128 (80K*128*4B = 40MB 波形 + YAMNet 中间量 ~215MB, GPU 内存充裕)。
+
+  14.4 优化 3: librosa 重采样 res_type → kaiser_fast (提速 ~2×)
+
+  Cell 6 _load_wf_py + Cell 10 _load_noisy_wf_py:
+    librosa.load(p, sr=cfg.SR, mono=True)  # 默认 res_type='kaiser_best' (慢)
+    → librosa.load(p, sr=cfg.SR, mono=True, res_type="kaiser_fast")
+
+  14.5 优化 4: iterrows → to_dict('records') (路径解析提速 ~10×)
+
+  Cell 8 build_embedding_cache:
+    for _, row in df.iterrows():         # 慢, ~10-20 μs/行
+    → for row in df.to_dict('records'):  # 快, ~1-2 μs/行
+
+  14.6 修改清单
+
+  ┌──────┬────────────────────────────────────────────────────────────┬────────┐
+  │ Cell │ 修改内容                                                  │ 类型   │
+  ├──────┼────────────────────────────────────────────────────────────┼────────┤
+  │  2   │ EMB_BATCH_SIZE 64 → 128                                  │ 优化   │
+  │  6   │ _load_wf_py: +res_type="kaiser_fast"                     │ 优化   │
+  │  6   │ build_embedding_extractor: 批量探测 + _select_frame_emb  │ 修复+优化│
+  │      │   + tf.map_fn 回退 (替代 vectorized_map)                  │        │
+  │  8   │ build_embedding_cache: 缓存维度校验 + 自动删旧缓存       │ 修复   │
+  │  8   │ build_embedding_cache: 提取后 dim 断言                   │ 修复   │
+  │  8   │ build_embedding_cache: iterrows → to_dict('records')     │ 优化   │
+  │  8   │ 时间估计: 200 → 400 条/分钟                              │ 优化   │
+  │ 10   │ _load_noisy_wf_py: +res_type="kaiser_fast"               │ 优化   │
+  └──────┴────────────────────────────────────────────────────────────┴────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 附录: 文件索引
+╚══════════════════════════════════════════════════════════════════════════════
+
+  YAMNet/src/
+  ├── yamnet_frozen_lightgbm_export.ipynb  ← 本交付物 (冻结版, 一键运行)
+  ├── handover_frozen_yamnet.txt            本交接文档
+  ├── yamnet_bird_pipeline.py             原冻结版管道 (旧数据, 参考)
+  ├── noise_robustness_eval.py             噪声评估 (旧数据, 参考)
+  ├── unified_evaluation.py                统一评估指标 (可后接)
+  ├── measure_inference.py                 推理测速 (旧版, 参考)
+  └── e2e/
+      ├── yamnet_e2e_all_in_one.ipynb      e2e 微调版 (未改动, 保留)
+      ├── yamnet_e2e_all_in_one.py         同上 .py 版
+      ├── yamnet_finetune_e2e.py            微调脚本
+      ├── audio_augmentation.py            数据增强模块
+      ├── noise_eval_e2e.py                e2e 噪声评估
+      └── measure_inference_e2e.py          e2e 推理测速
+
+  full-kaggle-data/processeddata-129834/
+  ├── 02_train_full_weighted.csv           129,834 训练样本
+  ├── 03_test_holdout.csv                  14,416 测试样本
+  ├── cv_fold{1-5}_train/val.csv           5 折 CV
+  └── class_weights.csv                    每类权重
+
+================================================================================
+  文档结束
+================================================================================

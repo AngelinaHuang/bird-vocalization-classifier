@@ -94,7 +94,22 @@ sampler_weight = 1 / 该鸟种在训练集中的样本数
 | 加噪 | 5、10、15 dB SNR | 不同录音环境 |
 | 音量增益 | 0.70x、0.85x、1.15x、1.30x | 距离和设备增益差异 |
 
-每条原始音频最多有 16 个候选增强版本；只生成补足目标所需的数量，每个鸟种最多新增 50 条，避免人工样本过度占比。
+每条原始音频最多有 16 个候选增强版本（5 种时间拉伸 + 4 种音高偏移 + 3 种加噪 + 4 种音量增益），每个鸟种最多新增 50 条，避免人工样本过度占比。同一条原始音频最多生成 16 个变体，防止单条录音过度代表。
+
+**分配策略**（由 `expand_train_df` 实现）：
+
+| 条件 | 策略 |
+| --- | --- |
+| `needed >= current_count` | 均匀分配：每条原始样本获得 `⌊needed / N⌋` 个变体；前 `needed % N` 条样本各多一个 |
+| `needed < current_count` | 随机选取：随机选择恰好 `needed` 条原始样本（种子控制，可复现），每条生成 1 个变体 |
+
+**`audio_augmentation.py` 中的关键参数**：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `target_per_species` | 15 | 增强后每物种最少有效样本数 |
+| `max_aug_per_species` | 50 | 每物种新增变体硬上限（防止失控） |
+| `seed` | 42 | 控制 `needed < current_count` 时的随机选择；每折种子使用 `cfg.SEED + fold` 保证可复现
 
 YAMNet 端到端训练建议在线增强：
 
@@ -110,16 +125,16 @@ YAMNet 端到端训练建议在线增强：
 
 ## 6. 当前生成文件
 
-正式数据位于 `processed data-129834/`：
+正式数据位于 `processeddata-129834/`：
 
 | 文件 | 内容 |
 | --- | --- |
-| `01_bird_only_full.csv` | 144,250 条清洗后鸟类记录 |
 | `02_train_full_weighted.csv` | 129,834 条训练记录，含 `class_count_train`、`sampler_weight`、`loss_class_weight`、`cv_fold` |
 | `03_test_holdout.csv` | 14,416 条固定测试记录 |
 | `class_weights.csv` | 每个鸟种的训练样本数和两种权重 |
 | `cv_fold{1-5}_train.csv` / `cv_fold{1-5}_val.csv` | 5 折训练/验证划分 |
-| `summary.csv` | 各数据集条数和鸟种数 |
+
+> `01_bird_only_full.csv`（144,250 条清洗后鸟类记录）和 `summary.csv`（各数据集条数和鸟种数）为中间过程文件，已移入备份目录 `过程文件仅作备份，无需使用/`，训练与评估无需使用。
 
 五个验证折的大小为 25,949-25,981 条。已验证训练/测试之间，以及每一折训练/验证之间的 `filename` 均无重叠。
 
@@ -128,7 +143,7 @@ YAMNet 端到端训练建议在线增强：
 生成命令：
 
 ```bash
-cd E:\MLwork\MLwork\data\augmenteddata
+cd E:\MLwork\MLwork\bird-vocalization-classifier\full-kaggle-data
 python prepare_full_training_data.py
 ```
 

@@ -1,0 +1,151 @@
+================================================================================
+  YAMNet 冻结嵌入提取 Notebook — 交接说明
+  作者: Wenjuan Huang
+  日期: 2026-07-18 / 更新: 2026-07-19
+  交付物: lightgbm/yamnet_embedding_extraction.ipynb
+================================================================================
+
+
+一、用途
+========
+
+  给队友的 YAMNet 嵌入提取代码。跑完后产出 .npz 嵌入文件, 队友自己的
+  LightGBM 代码读这些文件训练。两种用法:
+
+  用法 A (两段式, 传统):
+    1. 你跑这个 notebook -> Kaggle Output 生成 .npz 文件
+    2. 队友 Add Input 挂载你的 notebook output
+    3. 队友读 .npz 训练
+
+  用法 B (单 session, 无等待):
+    1. 队友把 Cell 2-6 粘贴到自己 notebook 最前面
+    2. Run All -> YAMNet 算完嵌入写盘 -> 队友代码读盘训练
+    3. 一次跑完, 不用等你先跑
+
+
+二、Notebook 结构 (9 个 Cell)
+==============================
+
+  Cell 0 (md)   : 概述 + 产出文件清单 + 时间估算
+  Cell 1 (md)   : Part 标题
+  Cell 2 (code) : 依赖导入 + Cfg 配置类 (路径, 嵌入维度, batch size)
+  Cell 3 (code) : Kaggle 挂载扫描 + CSV 加载 + 标签映射 (含执行)
+  Cell 4 (code) : 流式音频解码 + 冻结 YAMNet 嵌入提取器 (含构建模型)
+  Cell 5 (code) : 嵌入缓存 + 契约导出 + 噪声嵌入函数定义
+  Cell 6 (code) : 执行 YAMNet 全流程 (建缓存 -> 导出 -> 噪声嵌入)
+  Cell 7 (md)   : 队友如何加载嵌入 (说明)
+  Cell 8 (code) : 加载示例代码 (不执行, 供队友参考)
+
+
+三、产出文件
+=============
+
+  /kaggle/working/yamnet_embeddings/
+  ├── embeddings.npz          全量 ~144K 条 (filenames + emb, 3072 维) ← 训练用
+  ├── embeddings_clean.npz    测试集 ~14K 条 (filenames + emb)          ← clean 基线
+  ├── embeddings_5db.npz      测试集 ~14K 条 (filenames + emb)          ← 5dB 噪声
+  ├── embeddings_0db.npz      测试集 ~14K 条 (filenames + emb)          ← 0dB 噪声
+  ├── embeddings_m5db.npz     测试集 ~14K 条 (filenames + emb)          ← -5dB 噪声
+  └── label_map.json          label2idx + idx2label + classes           ← 标签映射
+
+  每个 .npz 的 key:
+  - filenames: (N,) str 数组, 如 abethr1/XC128013.ogg
+  - emb: (N, 3072) float32
+
+  内部缓存放 /kaggle/temp/ (不进 Kaggle output, 省 ~2.5 GB)
+
+
+四、队友接入方式 (极简)
+========================
+
+  队友只需改 3 行代码:
+
+  1. 加载嵌入 (替代原来的 MFCC 特征缓存):
+     d = np.load(.../embeddings.npz, allow_pickle=True)
+     fn2emb = {str(fn): d[emb][i] for i, fn in enumerate(d[filenames])}
+
+  2. 在 split_xy 里, 用 fn2emb 替换 fn2feat:
+     Xs.append(fn2emb[fn])    # 3072 维 (原来是 32 维 MFCC)
+
+  3. 标签映射用 label_map.json (保证与 YAMNet 一致):
+     with open(.../label_map.json) as f:
+         m = json.load(f)
+         label2idx = m[label2idx]
+         classes = m[classes]
+
+  其他代码 (lgb.train, fold 循环, accuracy 计算) 不需要改。
+
+  详细示例见 notebook Cell 8。
+
+
+五、挂载要求
+============
+
+  1. processeddata-129834 数据集 (CSV 元数据: fold 划分, 标签, 类权重)
+  2. BirdCLEF 2021-2026 年度音频数据集 (ogg 音频)
+  3. Accelerator: GPU (P100 或 T4, YAMNet 前向需要 GPU)
+
+
+六、时间估算
+============
+
+  阶段                    估算耗时       说明
+  ────────────────────  ──────────────  ──────────────────
+  全量嵌入提取            40-80 min      144K 文件, librosa 解码 + GPU 前向
+  噪声嵌入提取            10-20 min      14K 测试集 * 3 档 SNR
+  ────────────────────  ──────────────
+  合计 (首次运行)         ~1-2 小时      单个 Kaggle 9h session 足够
+  合计 (二次运行, 有缓存)  ~10-15 min     缓存秒读 (仅同 session 内)
+
+
+七、与原 yamnet_frozen_lightgbm_export.ipynb 的区别
+===================================================
+
+  维度            本 notebook                     原 notebook
+  ─────────────  ──────────────────────────────  ──────────────────────────────
+  Dense 头训练    不训练 (队友自己用 LightGBM)     训练 5 折 Dense 头
+  per-fold 切片   不导出 (省 ~8 GB)               导出 fold{N}_train/val.npz
+  内部缓存路径    /kaggle/temp/ (不进 output)     /kaggle/working/ (进 output)
+  噪声评估       不做 (队友自己评估)              做 (加载 head_model.keras)
+  推理测速       不做                             做
+
+  本 notebook 只做一件事: 算嵌入, 写 .npz, 完事。
+
+
+八、验证状态
+============
+
+  - AST 语法检查: 全部 6 个 code cell ast.parse() 通过
+  - 函数定义: 与 yamnet_frozen_lightgbm_export.ipynb (2026-07-19 最新版) 一致
+  - 路径: 内部缓存放 /kaggle/temp/, 契约输出放 /kaggle/working/
+  - 契约 key: filenames + emb (3072 维), 与原契约完全一致
+
+
+九、2026-07-19 更新内容
+=========================
+
+  从 yamnet_frozen_lightgbm_export.ipynb 同步以下修复和优化:
+
+  Bug 修复:
+  1. (致命) 新增 _select_frame_emb() 函数, 按 last_dim==1024 健壮选取
+     frame_embeddings。修复 YAMNet 返回 dict/tuple 时误取 logits(521维)
+     导致嵌入维度变成 1563 而非 3072 的问题。
+  2. 缓存维度校验: build_embedding_cache 读缓存时检查 cached_dim, 不匹配
+     自动删除旧缓存重算。
+  3. 嵌入维度断言: 提取后立即验证 X.shape[1]==EMBED_DIM, 维度不对直接报错。
+
+  性能优化:
+  4. 批量调用探测: 运行时探测 YAMNet KerasLayer 是否接受批量输入,
+     支持时一次前向整 batch (5-10x 加速), 不支持回退 tf.map_fn。
+  5. EMB_BATCH_SIZE: 64 -> 128
+  6. librosa res_type: 默认 -> "kaiser_fast" (~2x 解码加速)
+  7. iterrows() -> to_dict('records') (~10x 路径解析加速)
+  8. 时间估算: 200 -> 400 条/分钟
+
+  配置调整:
+  9. LABEL_MAP_PATH 改存 EMB_DIR (/kaggle/working/), 确保 label_map.json
+     也在契约输出目录中供队友直接读取。
+
+================================================================================
+  文档结束
+================================================================================
