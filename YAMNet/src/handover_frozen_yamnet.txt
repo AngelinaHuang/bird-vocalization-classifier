@@ -1,7 +1,7 @@
 ================================================================================
   YAMNet 冻结版 + LightGBM 嵌入导出 — 交接文档
   作者: Wenjuan Huang
-  日期: 2026-07-18 / 更新: 2026-07-19
+  日期: 2026-07-18 / 更新: 2026-07-20
   交付物: yamnet_frozen_lightgbm_export.ipynb
 ================================================================================
 
@@ -71,27 +71,33 @@
 
   注意: 原始 e2e 微调版 e2e/yamnet_e2e_all_in_one.ipynb 未改动, 保留
 
-3.2 Notebook 结构 (15 个 Cell)
+3.2 Notebook 结构 (16 个 Cell)
 
   Cell 0  (md)   : 概述 + 设计思路 + 数据集说明
   Cell 1  (md)   : Cell 1/7: 依赖与配置
-  Cell 2  (code) : 依赖导入 + Cfg 配置类 (POOL_MODE, EMBED_DIM=3072, 路径, 超参)
+  Cell 2  (code) : 依赖导入 (含 sklearn.metrics) + Cfg 配置类
+                   (POOL_MODE, EMBED_DIM=3072, 路径, 超参, 增强参数, 频率分组)
   Cell 3  (md)   : Cell 2/7: Kaggle 挂载扫描 + CSV 加载 + 标签映射
   Cell 4  (code) : scan_kaggle_inputs, resolve_audio_path, build_label_map
   Cell 5  (md)   : Cell 3/7: 流式音频解码 + 冻结 YAMNet 嵌入提取
-  Cell 6  (code) : _load_wf_py (librosa, res_type=kaiser_fast), _pool_frames (mean+max+std),
-                   build_embedding_extractor (冻结 YAMNet, 批量探测 + map_fn 回退),
-                   compute_embeddings_streaming
-  Cell 7  (md)   : Cell 4/7: 嵌入缓存 + LightGBM 导出 + 5 折分类头训练
-  Cell 8  (code) : build_embedding_cache, export_contract_embeddings, slice_embeddings,
-                   export_for_lightgbm, build_classifier, main_cv_head
+  Cell 6  (code) : _load_wf_py, _pool_frames, build_embedding_extractor,
+                   compute_embeddings_streaming, compute_embeddings_from_arrays
+  Cell 6b (code) : ★ 低资源音频增强模块 (内联自 audio_augmentation.py)
+                   aug_time_stretch/pitch_shift/add_noise/change_volume,
+                   AUG_METHODS, augment_waveform, expand_train_df,
+                   inject_augmented_waveforms, expand_with_augmentation
+  Cell 7  (md)   : Cell 4/7: 嵌入缓存 + 低资源增强 + LightGBM 导出 + 5 折训练
+  Cell 8  (code) : build_embedding_cache, augment_low_resource_species,
+                   export_contract_embeddings, slice_embeddings,
+                   export_for_lightgbm, compute_all_metrics,
+                   build_classifier, main_cv_head
   Cell 9  (md)   : Cell 5/7: 噪声鲁棒性评估 (流式)
-  Cell 10 (code) : add_gaussian_noise, _load_noisy_wf_py, build_noise_embeddings_streaming,
-                   main_noise_eval
+  Cell 10 (code) : add_gaussian_noise, _load_noisy_wf_py,
+                   build_noise_embeddings_streaming, main_noise_eval
   Cell 11 (md)   : Cell 6/7: 推理速度测试
   Cell 12 (code) : measure_inference (head-only + full pipeline)
   Cell 13 (md)   : 一键运行
-  Cell 14 (code) : main() — 顺序执行全流程
+  Cell 14 (code) : main() — 顺序执行全流程 (含增强阶段 1.5)
 
 3.3 参考的已有代码
 
@@ -137,8 +143,8 @@
   ├── embeddings_all.npz        内部嵌入缓存 (filenames + labels_str + emb)
   ├── noise_embeddings.npz      内部噪声缓存 (X_clean/X_5db/X_0db/X_m5db)
   ├── label_map.json            标签映射 (与 EMB_DIR 同步)
-  ├── cv_per_fold.csv           5 折 clean accuracy
-  ├── cv_noise_per_fold.csv    5 折噪声 accuracy
+  ├── cv_per_fold.csv           5 折综合指标 (Top-1/5, macro-F1, balanced acc, 分层)
+  ├── cv_noise_per_fold.csv    5 折噪声综合指标 (每档 SNR × 全部指标)
   ├── cv_summary.csv            汇总 mean+/-std
   ├── inference_metrics.csv     推理延迟
   └── fold{1-5}/
@@ -198,6 +204,11 @@
   DROPOUT            0.3           Dense 头 dropout
   SEED               42            随机种子
   N_FOLDS            5             交叉验证折数
+  LOW_RESOURCE_THRESHOLD 15        低资源物种阈值 (< 此数量视为低资源)
+  AUG_TARGET_PER_SPECIES 15        增强后每物种目标样本数
+  AUG_MAX_PER_SPECIES    50        每物种最多新增增强样本数
+  FREQ_GROUP_BINS    [0,15,50,200,inf]  类频率分组边界 (分层评估)
+  FREQ_GROUP_NAMES   tail/low/mid/head  类频率分组名称
 
   如需切换嵌入维度:
     POOL_MODE = "mean"        -> 1024 维 (和旧版一致)
@@ -315,8 +326,9 @@
      (FOLD_TO_RUN 环境变量), 分 5 个 Kaggle session 跑完
 
   5. 数据增强:
-     冻结版未做数据增强 (低资源物种扩充), 如需可在 tf.data pipeline 中
-     加入 time_stretch / pitch_shift / noise injection (在 _load_wf_py 后)
+     ✅ 已完成 (2026-07-20): 低资源物种 (<15 样本) 增强已内联到 notebook,
+     调用 expand_with_augmentation, 4 种变换 (time_stretch / pitch_shift /
+     additive noise / volume scaling), 在嵌入提取后、训练前执行
 
 
 ╔══════════════════════════════════════════════════════════════════════════════
@@ -554,6 +566,158 @@
   │  8   │ 时间估计: 200 → 400 条/分钟                              │ 优化   │
   │ 10   │ _load_noisy_wf_py: +res_type="kaiser_fast"               │ 优化   │
   └──────┴────────────────────────────────────────────────────────────┴────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║ 十五、2026-07-20 报告对齐 + 功能补全 + Kaggle Bug 修复
+╚══════════════════════════════════════════════════════════════════════════════
+
+  背景: 将 notebook 代码与中期报告 (HJJ-Mid-stage Report-V2.pdf) 逐项对比,
+  发现 7 处出入。按 "该改代码改代码, 该改报告改报告" 原则逐项修复。
+
+  15.1 出入诊断与处理方案
+
+  ┌───┬────────────────────────────┬──────────┬──────────────────────────────┐
+  │ # │ 出入描述                    │ 处理方案 │ 理由                          │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 1 │ 报告称 YAMNet 对 <15 样本  │ 改代码   │ 三大贡献之一, 缺了论文撑不住; │
+  │   │ 物种做 augmentation,       │          │ 159 种无增强则 tail class     │
+  │   │ 代码完全没有               │          │ 学不到; 模块已存在只需集成    │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 2 │ 报告称评估 Top-1/5,        │ 改代码   │ "reproducible evaluation      │
+  │   │ macro-F1, balanced acc,    │          │ framework" 只有 accuracy      │
+  │   │ 类频率分层; 代码只有 Top-1 │          │ 撑不起; sklearn 几行搞定      │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 3 │ 报告称 GPU memory          │ 改报告   │ 冻结 YAMNet 显存恒定 ~几百MB  │
+  │   │ profiling for YAMNet/      │          │ 无对比价值; 有意义的对比在    │
+  │   │ FastAI; 代码没做           │          │ FastAI fine-tune              │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 4 │ 报告称 "fixed seed=42";    │ 改报告   │ 代码做法 (42+index) 更科学:   │
+  │   │ 代码用 42+index 逐样本     │          │ 每样本独立噪声, 避免伪相关;   │
+  │   │                            │          │ 可复现性完全保留              │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 5 │ 代码有 ReduceLROnPlateau   │ 改报告   │ 训练工程标准操作, 报告加半句  │
+  │   │ 报告未提                   │          │ 即可, 方便复现                │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 6 │ 代码给验证集也传了         │ 改代码   │ 验证集应反映真实分布;         │
+  │   │ sample_weight              │          │ 加权 val_loss 影响 LR 衰减    │
+  ├───┼────────────────────────────┼──────────┼──────────────────────────────┤
+  │ 7 │ 代码额外导出了全量/噪声    │ 不改     │ 团队协作工程细节, 非方法论;   │
+  │   │ 嵌入文件, 报告未列         │          │ 报告不需要列每个输出文件      │
+  └───┴────────────────────────────┴──────────┴──────────────────────────────┘
+
+  15.2 Kaggle Bug 修复: pandas DataFrame 真值歧义 (致命)
+
+  现象:
+    Kaggle 全流程跑到 Stage 3 噪声评估最后一步, 写 cv_summary.csv 时崩溃:
+    ValueError: The truth value of a DataFrame is ambiguous.
+    此时 5 折训练 + LightGBM 导出 + 噪声嵌入 + 噪声评估已全部完成,
+    只差更新汇总 CSV 这最后一步。LightGBM 队友需要的文件全部已产出。
+
+  根因 (Cell 10 main_noise_eval, line 157):
+    existing = pd.read_csv(summary_path) if summary_path.exists() else None
+    if not existing:   # ← 💥 DataFrame 不能直接 bool 判断
+        existing = pd.DataFrame(columns=["metric", "mean", "std"])
+
+  修复:
+    if existing is None:   # ← 改为 is None 判断
+
+  影响: 仅影响 cv_summary.csv 的噪声指标追加; 所有 .npz 契约文件不受影响。
+
+  15.3 代码修改: 低资源物种增强 (#1)
+
+  方案: 将 e2e/audio_augmentation.py (~240 行有效代码) 内联到 notebook,
+  新增独立 Cell 6b, 实现 Kaggle 零依赖一键运行 (无需额外挂载 dataset)。
+
+  集成点:
+    main() 阶段 1.5: 嵌入提取后 → augment_low_resource_species() → 契约导出前
+    1. 读训练 CSV, 统计每物种样本数, 识别 <15 样本的物种
+    2. 加载低资源物种波形到内存 (~2400 条 × 320KB ≈ 750MB, 可承受)
+    3. 调用 expand_with_augmentation (4 种变换, 每物种补到 15 条, 上限 50)
+    4. compute_embeddings_from_arrays 从内存波形算嵌入 (新函数, Cell 6)
+    5. 合并增强嵌入到 fn2emb, 增强 DataFrame 传给 main_cv_head
+    6. main_cv_head 每折 pd.concat([df_train, aug_df]) 合并增强样本
+
+  函数名冲突处理:
+    原 audio_augmentation.py 中 time_stretch/pitch_shift/add_noise/change_volume
+    改为 aug_time_stretch/aug_pitch_shift/aug_add_noise/aug_change_volume
+
+  15.4 代码修改: 综合评估指标 (#2)
+
+  新增 compute_all_metrics() 函数 (Cell 8), 计算:
+    - top1_acc: Top-1 准确率
+    - top5_acc: Top-5 准确率 (sklearn top_k_accuracy_score)
+    - macro_f1: 宏平均 F1 (sklearn f1_score, average="macro")
+    - balanced_acc: 平衡准确率 (sklearn balanced_accuracy_score)
+    - acc_{group} / f1_{group}: 按类频率分组的分层指标
+      分组: tail(<15) / low(15-49) / mid(50-199) / head(>=200)
+
+  应用位置:
+    - main_cv_head: 每折测试集评估 → cv_per_fold.csv (全指标)
+    - main_noise_eval: 每折每档 SNR 评估 → cv_noise_per_fold.csv
+      列名格式: {snr}_{metric}, 如 "5dB_macro_f1", "-5dB_balanced_acc"
+
+  cv_summary.csv 自动汇总所有指标列 (通用逻辑, 不硬编码指标名)。
+
+  15.5 代码修改: 移除验证集 sample_weight (#6)
+
+  main_cv_head 中:
+    旧: validation_data=(X_va, y_va, sw_va) if sw_va is not None else (X_va, y_va)
+    新: validation_data=(X_va, y_va)
+  训练集仍使用 loss_class_weight 作为 sample_weight。
+  验证集不加权, 确保 val_loss (ReduceLROnPlateau 监控) 反映真实分布。
+
+  15.6 报告修改 (mid-stage-report.tex, 4 处, 仅改文案不动格式)
+
+  ┌──────────────────────────┬────────────────────────────────────────────────┐
+  │ 位置                      │ 修改内容                                      │
+  ├──────────────────────────┼────────────────────────────────────────────────┤
+  │ Evaluation Protocol       │ "fixed seed=42" → "deterministic per-sample   │
+  │ (item 2)                  │ seeding with base seed=42"                    │
+  ├──────────────────────────┼────────────────────────────────────────────────┤
+  │ Implementation Details    │ "fixed seed=42" → "deterministic per-sample   │
+  │ (bullet 2)                │ seeding (base seed=42)"                       │
+  ├──────────────────────────┼────────────────────────────────────────────────┤
+  │ Implementation Details    │ "GPU memory profiling for YAMNet/FastAI" →    │
+  │ (bullet 4)                │ "GPU memory profiling for FastAI fine-tuning  │
+  │                           │ (YAMNet embedding extraction uses <1 GB as    │
+  │                           │ a one-time cost)"                             │
+  ├──────────────────────────┼────────────────────────────────────────────────┤
+  │ YAMNet Design             │ "early stopping (patience=8), loss_class_     │
+  │ (paragraph)               │ weight as sample weights" → 加入              │
+  │                           │ "ReduceLROnPlateau (factor=0.5, patience=4)"  │
+  │                           │ + "training sample weights"                   │
+  └──────────────────────────┴────────────────────────────────────────────────┘
+
+  15.7 Kaggle 中间产物可用性分析
+
+  结论: 只要 Stage 1 (嵌入提取) 跑完, LightGBM 队友就能用。
+  - embeddings.npz (全量 144K×3072) 是最关键文件, Stage 1 完成即导出
+  - 即使 per-fold .npz 不全, 队友可用 embeddings.npz + 原始 fold CSV 自行切片
+  - 本次 Kaggle 跑挂在 Stage 3 最后一步, 所有契约文件已完整产出
+  - 增强后 embeddings.npz 包含增强样本嵌入, 队友无需额外处理
+
+  15.8 修改文件清单
+
+  ┌──────────────────────────────────────────────────────┬────────────────┐
+  │ 文件                                                  │ 修改类型       │
+  ├──────────────────────────────────────────────────────┼────────────────┤
+  │ YAMNet/src/yamnet_frozen_lightgbm_export.ipynb       │ 代码 (主改)    │
+  │   Cell 2:  +sklearn 导入, +增强/分层配置, -sys.path  │                │
+  │   Cell 6:  +compute_embeddings_from_arrays            │                │
+  │   Cell 6b: ★新增 低资源增强模块 (内联 ~240 行)       │                │
+  │   Cell 8:  +augment_low_resource_species              │                │
+  │            +compute_all_metrics                       │                │
+  │            main_cv_head: +aug_df, -sw_va, +全指标     │                │
+  │   Cell 10: if not existing → if existing is None (bug)│                │
+  │            main_noise_eval: +全指标, +class_train_cnt  │                │
+  │   Cell 14: main() +增强阶段 1.5, 传参更新             │                │
+  │   Cell 0/5/7/9: Markdown 说明更新                     │                │
+  ├──────────────────────────────────────────────────────┼────────────────┤
+  │ mid-stage-report/mid-stage-report.tex                 │ 报告文案 (4处) │
+  ├──────────────────────────────────────────────────────┼────────────────┤
+  │ YAMNet/src/handover_frozen_yamnet.txt                 │ 本文档更新     │
+  └──────────────────────────────────────────────────────┴────────────────┘
 
 
 ╔══════════════════════════════════════════════════════════════════════════════
