@@ -15,6 +15,7 @@
 \usepackage{booktabs}
 \usepackage{caption}
 \usepackage{hyperref}
+\usepackage{cite}
 
 \hyphenation{op-tical net-works semi-conduc-tor}
 
@@ -53,11 +54,11 @@ Automated bird vocalization classification from passive acoustic monitoring is c
 
 \section{Introduction}
 
-Automated bird vocalization classification is essential for large-scale biodiversity monitoring, yet field recordings pose dual challenges: environmental noise masks discriminative spectral features, and species distributions follow an extreme long-tail pattern where rare species have minimal training data [1]--[3]. These compounding factors severely degrade classifier performance, particularly for the very species most in need of conservation monitoring.
+Automated bird vocalization classification is essential for large-scale biodiversity monitoring, yet field recordings pose dual challenges: environmental noise masks discriminative spectral features, and species distributions follow an extreme long-tail pattern where rare species have minimal training data \cite{kahl2021birdnet, van2025perch, funosas2026global}. These compounding factors severely degrade classifier performance, particularly for the very species most in need of conservation monitoring.
 
-Existing off-the-shelf solutions such as BirdNET [1] and Google Perch [2] demonstrate significant limitations under these conditions. BirdNET's accuracy degrades markedly when SNR falls below 3 dB [3], and its recall varies drastically across regions—from PR AUC 0.16--0.23 in North America and Europe to 0.03--0.04 in Africa and Asia [3]. Perch achieves only $\sim$60\% accuracy on BirdCLEF+ 2025 data containing species outside its training set [2]. Critically, neither provides standardized, quantifiable noise robustness evaluation nor cross-paradigm comparisons that include traditional ML baselines.
+Existing off-the-shelf solutions such as BirdNET \cite{kahl2021birdnet} and Google Perch \cite{van2025perch} demonstrate significant limitations under these conditions. BirdNET's accuracy degrades markedly when SNR falls below 3 dB \cite{funosas2026global}, and its recall varies drastically across regions—from PR AUC 0.16--0.23 in North America and Europe to 0.03--0.04 in Africa and Asia \cite{funosas2026global}. Perch achieves only $\sim$60\% accuracy on BirdCLEF+ 2025 data containing species outside its training set \cite{van2025perch}. Critically, neither provides standardized, quantifiable noise robustness evaluation nor cross-paradigm comparisons that include traditional ML baselines.
 
-This project addresses these gaps through three pipelines on a unified 129,834-sample dataset with controlled noise evaluation: (1) frozen YAMNet (MobileNetV1, AudioSet [4]) with a Dense head on 3072-dimensional clip-level pooled embeddings (aggregated from 1024-dimensional frame-level outputs); (2) LightGBM on the same 3072-dimensional pooled features---a two-stage cascade decoupling neural feature extraction from tree-based classification, enabling GPU-free training and modular experimentation; and (3) FastAI ConvNeXt-Small on mel-spectrograms. All share identical 5-fold CV, the same SNR evaluation protocol, CSV \texttt{loss\_class\_weight}, and targeted audio augmentation for species with fewer than 15 training samples. Evaluation uses clean audio plus Gaussian noise at 5 dB, 0 dB, and $-$5 dB SNR. While we use Gaussian white noise as a controlled, reproducible baseline, qualitatively different field noise (wind, rain, insect interference) is discussed in Section V.
+This project addresses these gaps through three pipelines on a unified 129,834-sample dataset with controlled noise evaluation: (1) frozen YAMNet (MobileNetV1, AudioSet \cite{hershey2017cnn}) with a Dense head on 3072-dimensional clip-level pooled embeddings (aggregated from 1024-dimensional frame-level outputs); (2) LightGBM on the same 3072-dimensional pooled features---a two-stage cascade decoupling neural feature extraction from tree-based classification, enabling GPU-free training and modular experimentation; and (3) FastAI ConvNeXt-Small on mel-spectrograms. All share identical 5-fold CV, the same SNR evaluation protocol, CSV \texttt{loss\_class\_weight}, and targeted audio augmentation for species with fewer than 15 training samples. Evaluation uses clean audio plus Gaussian noise at 5 dB, 0 dB, and $-$5 dB SNR. While we use Gaussian white noise as a controlled, reproducible baseline, qualitatively different field noise (wind, rain, insect interference) is discussed in Section V.
 
 Our contributions are threefold: (i) a reproducible cross-paradigm evaluation framework with common data splits and standardized noise testing; (ii) empirical insights into trade-offs between frozen embedding classifiers, embedding-based gradient boosting, and spectrogram-based classification---with emphasis on the YAMNet+LightGBM cascade as a computationally efficient alternative to monolithic systems; and (iii) a practical framework combining shared CSV-based class weighting and targeted low-resource augmentation with standardized evaluation for low-resource bioacoustic classification.
 
@@ -66,19 +67,19 @@ Our contributions are threefold: (i) a reproducible cross-paradigm evaluation fr
 
 \subsection{BirdNET and Google Perch: Off-the-Shelf Solutions}
 
-BirdNET [1] (Cornell Lab/Chemnitz University) uses an EfficientNetB0-like backbone with 1024-dimensional embeddings, classifying 48 kHz audio into 3,337 classes [7]. Despite its widespread adoption, it exhibits: (1) severe performance degradation below 3 dB SNR [3]; (2) highly heterogeneous recall across regions (0.24--0.52) and species rarity levels [3]; and (3) label noise and dataset imbalances as primary error sources [8]. Google Perch [2] (EfficientNet-B1) achieves state-of-the-art on BirdSET and BEANS benchmarks [9], [10] but only $\sim$60\% accuracy on BirdCLEF+ 2025 data with out-of-training-set species. Critically, neither provides standardized controllable noise testing pipelines.
+BirdNET \cite{kahl2021birdnet} (Cornell Lab/Chemnitz University) uses an EfficientNetB0-like backbone with 1024-dimensional embeddings, classifying 48 kHz audio into 3,337 classes \cite{kahl2025birdnet}. Despite its widespread adoption, it exhibits: (1) severe performance degradation below 3 dB SNR \cite{funosas2026global}; (2) highly heterogeneous recall across regions (0.24--0.52) and species rarity levels \cite{funosas2026global}; and (3) label noise and dataset imbalances as primary error sources \cite{assarzadeh2025investigating}. Google Perch \cite{van2025perch} (EfficientNet-B1) achieves state-of-the-art on BirdSET and BEANS benchmarks \cite{rauch2024birdset, hagiwara2023beans} but only $\sim$60\% accuracy on BirdCLEF+ 2025 data with out-of-training-set species. Critically, neither provides standardized controllable noise testing pipelines.
 
 \subsection{BirdCLEF Competitions: Persistent Challenges}
 
-The BirdCLEF series (2021--2026) consistently benchmarks core challenges: long-tailed distributions, weak labeling (recording-level vs. segment-level), and domain shift between Xeno-Canto training and PAM test soundscapes [5], [11]. BirdCLEF+ 2025 saw foundation models like BEATs achieve 0.913 F1 with pseudo-labeling [12]. These competitions underscore that no integrated solution spans data, model, and evaluation dimensions for low-resource noisy environments.
+The BirdCLEF series (2021--2026) consistently benchmarks core challenges: long-tailed distributions, weak labeling (recording-level vs. segment-level), and domain shift between Xeno-Canto training and PAM test soundscapes \cite{birdclef, witting2024addressing}. BirdCLEF+ 2025 saw foundation models like BEATs achieve 0.913 F1 with pseudo-labeling \cite{chen2023beats}. These competitions underscore that no integrated solution spans data, model, and evaluation dimensions for low-resource noisy environments.
 
 \subsection{Noise Robustness and Low-Resource Classification}
 
-Environmental noise remains a formidable obstacle. Noise reduction preprocessing can help but occasionally degrades performance by removing informative features [13]. Data augmentation with real environmental noise under varying SNR has proven effective [5], [14], and generative approaches (ACGANs, DDPMs) show promise [15]. For low-resource species, transfer learning is essential: avian-specific embeddings outperform general audio embeddings [16], and AudioSet pre-training followed by fine-tuning boosts low-resource performance [17], [16]. Few-shot approaches (Siamese networks) target rare species absent from BirdNET/Perch [18]. However, existing studies rarely provide systematic cross-paradigm comparisons on identical datasets.
+Environmental noise remains a formidable obstacle. Noise reduction preprocessing can help but occasionally degrades performance by removing informative features \cite{denton2022separation}. Data augmentation with real environmental noise under varying SNR has proven effective \cite{birdclef, miyaguchi2023transfer}, and generative approaches (ACGANs, DDPMs) show promise \cite{generative2024}. For low-resource species, transfer learning is essential: avian-specific embeddings outperform general audio embeddings \cite{ghani2023global}, and AudioSet pre-training followed by fine-tuning boosts low-resource performance \cite{gemmeke2017audio, ghani2023global}. Few-shot approaches (Siamese networks) target rare species absent from BirdNET/Perch \cite{fewshot2023}. However, existing studies rarely provide systematic cross-paradigm comparisons on identical datasets.
 
 \subsection{YAMNet and Audio Transfer Learning}
 
-YAMNet [4], [17] (MobileNetV1, AudioSet-trained) outputs 1024-dimensional frame-level embeddings at 0.48-second intervals. In our pipelines, these frames are aggregated by mean, maximum, and standard deviation into 3072-dimensional clip-level pooled features for downstream classifiers. It has been adapted for speech recognition, urban noise, and industrial monitoring [19]. While domain-specific models (Perch, BirdNET) outperform general-purpose ones on complex calls [16], [20], YAMNet provides a computationally accessible baseline for raw audio classification.
+YAMNet \cite{hershey2017cnn, gemmeke2017audio} (MobileNetV1, AudioSet-trained) outputs 1024-dimensional frame-level embeddings at 0.48-second intervals. In our pipelines, these frames are aggregated by mean, maximum, and standard deviation into 3072-dimensional clip-level pooled features for downstream classifiers. It has been adapted for speech recognition, urban noise, and industrial monitoring \cite{yamnet2025transfer}. While domain-specific models (Perch, BirdNET) outperform general-purpose ones on complex calls \cite{ghani2023global, vggish}, YAMNet provides a computationally accessible baseline for raw audio classification.
 
 \subsection{Research Gap Summary}
 
@@ -91,7 +92,7 @@ The literature reveals six critical gaps: (1) no unified framework comparing tab
 
 \subsubsection{Data Source and Collection}
 
-Compiled from BirdCLEF 2021--2026, aggregating Xeno-Canto and iNaturalist recordings [5], [6]. Raw merge of six annual CSVs: 183,239 records. Field-level deduplication (zero-information-loss merge) yielded 167,308 unique recordings.
+Compiled from BirdCLEF 2021--2026, aggregating Xeno-Canto and iNaturalist recordings \cite{birdclef, xenocanto}. Raw merge of six annual CSVs: 183,239 records. Field-level deduplication (zero-information-loss merge) yielded 167,308 unique recordings.
 
 \subsubsection{Data Cleaning and Quality Control}
 
@@ -148,7 +149,7 @@ Species distribution: median $\sim$72 training samples/species, minimum 1, head 
         w_{\text{loss}}(c) = \operatorname{clip}\left(\frac{1/\sqrt{N_c}}{\mu_w},\, 0.25,\, 4.00\right)
         \label{eq:loss_weight}
     \end{equation}
-    Inverse-square-root is milder than $1/N_c$; clipping ensures stability. Species with fewer than 15 training samples are treated as low-resource tail classes, consistent with BirdCLEF findings that such species exhibit near-random performance [11].
+    Inverse-square-root is milder than $1/N_c$; clipping ensures stability. Species with fewer than 15 training samples are treated as low-resource tail classes, consistent with BirdCLEF findings that such species exhibit near-random performance \cite{witting2024addressing}.
     
     \item \textbf{Targeted audio augmentation}: 159 species (14.1\%) with $<$15 training examples receive four on-the-fly waveform transformations implemented in \texttt{audio\_augmentation.py}: time stretching (0.85$\times$--1.10$\times$), pitch shifting ($\pm$1--$\pm$2 semitones), additive Gaussian noise (5--15 dB SNR), and volume scaling (0.70$\times$--1.30$\times$), capped at 16 variants per recording and 50 new variants per species, with a per-species target of 15 samples. This augmentation is enabled in all three reported pipelines: YAMNet applies \texttt{expand\_with\_augmentation} before embedding extraction and Dense-head training; LightGBM trains on 3072-dimensional pooled embeddings computed from the same augmented training folds; FastAI generates augmented mel-spectrogram PNGs via \texttt{augmentation\_glue.py} before ConvNeXt training.
 \end{enumerate}
@@ -167,7 +168,7 @@ Fixed test set (14,416) reserved for final evaluation only. Metrics:
 
 \subsubsection{Frozen YAMNet Embeddings with Dense Head}
 
-\textbf{Rationale.} MobileNetV1 pre-trained on AudioSet's 521 categories [4] provides general-purpose acoustic features transferable to bird vocalizations. AudioSet includes environmental noise [17], giving inherent noise-robust representations. We freeze the encoder and train only a lightweight head on pooled embeddings [16].
+\textbf{Rationale.} MobileNetV1 pre-trained on AudioSet's 521 categories \cite{hershey2017cnn} provides general-purpose acoustic features transferable to bird vocalizations. AudioSet includes environmental noise \cite{gemmeke2017audio}, giving inherent noise-robust representations. We freeze the encoder and train only a lightweight head on pooled embeddings \cite{ghani2023global}.
 
 \textbf{Design.} 16 kHz mono, 5-second clips (center-crop or zero-pad), peak-normalized. (1) Frozen YAMNet encoder (\texttt{trainable=False}) outputs 1024-dimensional frame-level embeddings every 0.48 s; mean, max, and std pooling across frames $\rightarrow$ 3072-dimensional clip-level feature vector. (2) Dense head: Dense(256, ReLU) $\rightarrow$ Dropout(0.3) $\rightarrow$ Dense(1126, Softmax). Adam ($\text{lr}=10^{-3}$), up to 50 epochs, early stopping (patience=8), ReduceLROnPlateau (factor=0.5, patience=4), \texttt{loss\_class\_weight} as training sample weights. Low-resource species ($<$15 samples) are expanded via \texttt{expand\_with\_augmentation} before embedding extraction. Embeddings are cached once and exported per fold for LightGBM. Noise evaluation re-computes clip-level pooled embeddings on noisy test audio.
 
@@ -185,7 +186,7 @@ Fixed test set (14,416) reserved for final evaluation only. Metrics:
 
 \subsubsection{FastAI ConvNeXt: Mel-Spectrogram Image Classification}
 
-\textbf{Rationale.} Mel-spectrograms expose harmonic structures, formant patterns, and temporal modulations. ConvNeXt-Small provides strong performance with ImageNet transfer learning [14], [11]. Long-tail imbalance is handled with the same CSV \texttt{loss\_class\_weight} as YAMNet/LightGBM, supplemented by spectrogram-level MixUp and RandomErasing. Low-resource waveform augmentation is applied upstream via \texttt{augmentation\_glue.py} before PNG caching.
+\textbf{Rationale.} Mel-spectrograms expose harmonic structures, formant patterns, and temporal modulations. ConvNeXt-Small provides strong performance with ImageNet transfer learning \cite{miyaguchi2023transfer, witting2024addressing}. Long-tail imbalance is handled with the same CSV \texttt{loss\_class\_weight} as YAMNet/LightGBM, supplemented by spectrogram-level MixUp and RandomErasing. Low-resource waveform augmentation is applied upstream via \texttt{augmentation\_glue.py} before PNG caching.
 
 \textbf{Design.} 16 kHz mono; highest-RMS 5 s segment; 128 mel bands (\texttt{n\_fft=1024}, hop 512, 500--8000 Hz) $\rightarrow$ Viridis RGB images at 224$\times$224 (cached offline, including augmented low-resource samples). ConvNeXt-Small, FP16, CSV \texttt{loss\_class\_weight} as sample weights, MixUp ($\alpha=0.4$), RandomErasing ($p=0.4$). \texttt{fine\_tune}: 3 frozen epochs + 12 full-network epochs (\texttt{base\_lr=$2\times10^{-3}$}). Metrics: Top-1 and macro-F1.
 
@@ -235,68 +236,7 @@ All pipelines share:
 The authors would like to thank their advisor for guidance and the Kaggle community for providing the BirdCLEF datasets.
 
 
-\begin{thebibliography}{99}
-
-\bibitem{kahl2021birdnet}
-S. Kahl, C. M. Wood, M. Eibl, and H. Klinck, ``BirdNET: A deep learning solution for avian diversity monitoring,'' \textit{Ecological Informatics}, vol. 61, p. 101236, 2021.
-
-\bibitem{van2025perch}
-B. van Merri\"{e}nboer et al., ``Perch 2.0: The bittern lesson for bioacoustics,'' \textit{arXiv:2508.04665}, 2025.
-
-\bibitem{funosas2026global}
-D. Funosas et al., ``A global assessment of BirdNET performance: Differences among continents, biomes, and species,'' \textit{Ecological Indicators}, vol. 182, p. 114550, 2026.
-
-\bibitem{yamnet2024}
-S. Hershey et al., ``CNN architectures for large-scale audio classification,'' in \textit{Proc. IEEE ICASSP}, 2017. \textit{(YAMNet implements this architecture on AudioSet [17]; public model release: TensorFlow Hub, 2019.)}
-
-\bibitem{birdclef2026}
-Cornell Lab of Ornithology, ``BirdCLEF / BirdCLEF+ competitions (2021--2026),'' Kaggle, 2026.
-
-\bibitem{xenocanto}
-Xeno-Canto Foundation, ``Xeno-Canto: Sharing bird sounds from around the world,'' \url{https://xeno-canto.org/}.
-
-\bibitem{kahl2025birdnetv2}
-S. Kahl, C. M. Wood, and H. Klinck, ``BirdNET model v2.4,'' Zenodo, 2025.
-
-\bibitem{assarzadeh2025investigating}
-M. Assarzadeh, P. Atufi, M. Eibl, and S. Kahl, ``Investigating misclassification in bird sounds: The adverse effect of label noise on BirdNET,'' \textit{Ecological Informatics}, vol. 92, p. 103494, 2025.
-
-\bibitem{rauch2024birdset}
-L. Rauch et al., ``BirdSet: A large-scale dataset for audio classification in avian bioacoustics,'' \textit{arXiv:2403.10380}, 2024.
-
-\bibitem{hagiwara2023beans}
-M. Hagiwara et al., ``BEANS: The benchmark of animal sounds,'' in \textit{Proc. IEEE ICASSP}, 2023, arXiv:2210.12300.
-
-\bibitem{witting2024addressing}
-E. Witting, H. de Heer, J. Lim, C. T. Kopar, and K. S\'{a}ndor, ``Addressing the challenges of domain shift in bird call classification for BirdCLEF 2024,'' in \textit{CEUR Workshop Proc.}, vol. 3740, 2024.
-
-\bibitem{chen2023beats}
-S. Chen et al., ``BEATs: Audio pre-training with acoustic tokenizers,'' in \textit{ICML 2023}, arXiv:2212.09058.
-
-\bibitem{denton2022improving}
-T. Denton, S. Wisdom, and J. R. Hershey, ``Improving bird classification with unsupervised sound separation,'' in \textit{Proc. IEEE ICASSP}, 2022, arXiv:2110.03209.
-
-\bibitem{miyaguchi2023transfer}
-A. Miyaguchi, N. Zhong, M. Gustineli, and C. Hayduk, ``Transfer learning with semi-supervised dataset annotation for birdcall classification,'' in \textit{CLEF 2023 Working Notes}.
-
-\bibitem{gibbons2024generative}
-A. Gibbons, E. King, I. Donohue, and A. Parnell, ``Generative AI-based data augmentation for improved bioacoustic classification in noisy environments,'' \textit{arXiv:2412.01530}, 2024.
-
-\bibitem{ghani2023global}
-B. Ghani, T. Denton, S. Kahl, and H. Klinck, ``Global birdsong embeddings enable superior transfer learning for bioacoustic classification,'' \textit{Scientific Reports}, vol. 13, p. 22876, 2023.
-
-\bibitem{gemmeke2017audioset}
-J. F. Gemmeke et al., ``Audio set: An ontology and human-labeled dataset for audio events,'' in \textit{ICASSP 2017}.
-
-\bibitem{zhong2023comparison}
-M. Zhong, J. LeBien, M. Campos-Cerqueira, T. M. Aide, R. Dodhia, and J. Lavista Ferres, ``A comparison of convolutional neural networks and few-shot learning in classifying long-tailed distributed tropical bird songs,'' \textit{bioRxiv}, 2023.
-
-\bibitem{liu2025yamnet}
-L. Liu et al., ``YAMNet-based transfer learning for compact noise classification in urban and wireless systems,'' \textit{EURASIP J. Wireless Commun. Netw.}, vol. 2025, no. 1, p. 74, 2025.
-
-\bibitem{vggish2024}
-``VGGish: Audio feature embedding model,'' Kaggle Models, 2024.
-
-\end{thebibliography}
+\bibliographystyle{IEEEtran}
+\bibliography{references}
 
 \end{document}
